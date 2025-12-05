@@ -1,20 +1,19 @@
-package org.example;
+package org.example.SqlTransitAI.tool;
 
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
-import net.sf.jsqlparser.statement.Statements;
 import net.sf.jsqlparser.statement.Statement;
+import net.sf.jsqlparser.statement.Statements;
+
 import java.lang.reflect.Method;
-import java.util.Collection;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.Scanner;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Scanner;
+import java.util.Set;
 
-/**
- * 针对DDL和DML脚本的SQL分析工具
- */
-public class SQLTransit {
+public class JsqlParse {
+
     public static void main(String[] args) throws Exception {
         Scanner scanner = new Scanner(System.in);
         System.out.print("请输入SQL脚本文件路径: ");
