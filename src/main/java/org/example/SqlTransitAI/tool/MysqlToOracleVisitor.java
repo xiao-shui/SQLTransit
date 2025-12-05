@@ -12,6 +12,8 @@ import net.sf.jsqlparser.expression.Expression;
 
 import java.util.List;
 import java.util.stream.Collectors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MysqlToOracleVisitor extends StatementVisitorAdapter {
     private StringBuilder oracleSql = new StringBuilder();
@@ -62,11 +64,95 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         return sb.toString();
     }
 
+    // 新增工具方法：大写WHERE条件表达式的属性名（不影响字符串常量及部分SQL关键字）
+    private String uppercaseWhereColumnNames(String sql) {
+        // 正则提取SQL标识符(列名)并大写，忽略字符串中的内容
+        // 本实现简单保守，仅针对通常格式的列名/表名.列名进行大写，跳过function/数字/带引号情况
+        StringBuilder sb = new StringBuilder();
+        boolean inString = false;
+        int len = sql.length();
+        int i = 0;
+        while (i < len) {
+            char ch = sql.charAt(i);
+            if (ch == '\'') {
+                sb.append(ch);
+                i++;
+                // 跳过整个字符串字面量
+                while (i < len) {
+                    char cc = sql.charAt(i);
+                    sb.append(cc);
+                    if (cc == '\'') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '\'') {
+                            sb.append('\''); i += 2; continue;
+                        } else {
+                            i++; break;
+                        }
+                    }
+                    i++;
+                }
+                continue;
+            }
+            // 检查.前的token或独立字段名
+            if (Character.isJavaIdentifierStart(ch)) {
+                int start = i;
+                int end = i + 1;
+                while (end < len && Character.isJavaIdentifierPart(sql.charAt(end))) end++;
+                String token = sql.substring(start, end);
+                // 判断是否是函数名 （紧跟左括号）、SQL关键字跳过
+                boolean isFunc = (end < len && sql.charAt(end) == '(');
+                String keyword = token.toUpperCase();
+                // 不大写SQL常用关键字（可扩展）
+                if (
+                        "AND".equals(keyword) ||
+                                "OR".equals(keyword) ||
+                                "NOT".equals(keyword) ||
+                                "IS".equals(keyword) ||
+                                "IN".equals(keyword) ||
+                                "LIKE".equals(keyword) ||
+                                "BETWEEN".equals(keyword) ||
+                                "NULL".equals(keyword) ||
+                                "EXISTS".equals(keyword) ||
+                                "TRUE".equals(keyword) ||
+                                "FALSE".equals(keyword)
+                ) {
+                    sb.append(token);
+                    i = end;
+                    continue;
+                }
+                if (!isFunc) {
+                    // 检查是否 table.col 形式
+                    if (end < len && sql.charAt(end) == '.') {
+                        int j = end + 1;
+                        if (j < len && Character.isJavaIdentifierStart(sql.charAt(j))) {
+                            int idStart = j;
+                            int idEnd = idStart + 1;
+                            while (idEnd < len && Character.isJavaIdentifierPart(sql.charAt(idEnd))) idEnd++;
+                            String tname = token.toUpperCase();
+                            String cname = sql.substring(idStart, idEnd).toUpperCase();
+                            sb.append(tname).append('.').append(cname);
+                            i = idEnd;
+                            continue;
+                        }
+                    }
+                    // 普通列名
+                    sb.append(token.toUpperCase());
+                    i = end;
+                    continue;
+                }
+                sb.append(token);
+                i = end;
+                continue;
+            } else {
+                sb.append(ch); i++;
+            }
+        }
+        return sb.toString();
+    }
+
     // 处理 CREATE TABLE（核心差异：自增、字段类型、默认值、字段名大写，无需加引号，UNIQUE/NOT NULL约束处理）
     @Override
     public void visit(CreateTable createTable) {
         String tableName = createTable.getTable().getName().toUpperCase();
-        String tableNameLower = createTable.getTable().getName().toLowerCase();
         oracleSql.append("CREATE TABLE ").append(tableName).append(" (\n");
 
         List<ColumnDefinition> columns = createTable.getColumnDefinitions();
@@ -82,7 +168,6 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
             }
 
             String colName = col.getColumnName().toUpperCase();
-            String colNameLower = col.getColumnName().toLowerCase();
             String colType = convertColumnType(col.getColDataType().getDataType(), col.getColDataType().getArgumentsStringList());
 
             // JSQLParser 4.x 以后没有 getColumnSpecStrings，使用 getColumnSpecs（通常是 List<?> 或 List<Object>）
@@ -180,10 +265,10 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 if (uniqueConstraints.length() > 0) {
                     uniqueConstraints.append(",\n");
                 }
-                uniqueConstraints.append("    CONSTRAINT uk_")
-                        .append(tableNameLower)
+                uniqueConstraints.append("    CONSTRAINT UK_")
+                        .append(tableName)
                         .append("_")
-                        .append(colNameLower)
+                        .append(colName)
                         .append(" UNIQUE(")
                         .append(colName)
                         .append(")");
@@ -296,9 +381,10 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         // WHERE 条件
         Expression where = delete.getWhere();
         if (where != null) {
-            // 尝试保留原生SQL语句的where部份，替换CURRENT_TIMESTAMP、true/false
+            // 尝试保留原生SQL语句的where部份，替换CURRENT_TIMESTAMP、true/false，并大写属性名
             String whereStr = where.toString().replace("CURRENT_TIMESTAMP", "SYSDATE");
             whereStr = replaceBooleanLiterals(whereStr);
+            whereStr = uppercaseWhereColumnNames(whereStr);
             oracleSql.append(" WHERE ").append(whereStr);
         }
         oracleSql.append(";\n\n");
@@ -319,6 +405,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
             String colName = rawColName.replaceAll("^[`'\"]+|[`'\"]+$", "").toUpperCase();
             String valueExpr = expressions.get(i).toString().replace("CURRENT_TIMESTAMP", "SYSDATE");
             valueExpr = replaceBooleanLiterals(valueExpr);
+            valueExpr = uppercaseWhereColumnNames(valueExpr);
             oracleSql.append(colName).append("=").append(valueExpr);
             if (i < columns.size() - 1) {
                 oracleSql.append(", ");
@@ -329,6 +416,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         if (where != null) {
             String whereStr = where.toString().replace("CURRENT_TIMESTAMP", "SYSDATE");
             whereStr = replaceBooleanLiterals(whereStr);
+            whereStr = uppercaseWhereColumnNames(whereStr);
             oracleSql.append(" WHERE ").append(whereStr);
         }
         oracleSql.append(";\n\n");
