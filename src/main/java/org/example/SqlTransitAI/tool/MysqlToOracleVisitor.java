@@ -1,428 +1,289 @@
 package org.example.SqlTransitAI.tool;
 
+import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.create.table.ColumnDefinition;
 import net.sf.jsqlparser.statement.create.table.CreateTable;
 import net.sf.jsqlparser.statement.create.index.CreateIndex;
 import net.sf.jsqlparser.statement.insert.Insert;
-import net.sf.jsqlparser.statement.StatementVisitorAdapter;
-import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.statement.delete.Delete;
 import net.sf.jsqlparser.statement.update.Update;
 import net.sf.jsqlparser.expression.Expression;
+import net.sf.jsqlparser.schema.Column;
+import net.sf.jsqlparser.statement.StatementVisitorAdapter;
 
-import java.util.List;
+import java.lang.reflect.Field;
+import java.util.*;
 import java.util.stream.Collectors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MysqlToOracleVisitor extends StatementVisitorAdapter {
-    private StringBuilder oracleSql = new StringBuilder();
+    private final StringBuilder oracleSql = new StringBuilder();
+    private final List<String> comments = new ArrayList<>(); // 用于保存要输出的COMMENT ON语句
 
-    // 工具方法：将表达式SQL里的 true/false 替换为 1/0 (忽略字符串字面量)
+    // 工具方法：清理标识符（去除引号并大写）
+    private String cleanIdentifier(String name) {
+        if (name == null) return null;
+        return name.replaceAll("^[`'\"]+|[`'\"]+$", "").toUpperCase();
+    }
+
+    // 工具方法：替换布尔字面量 true/false → Y/N（忽略字符串内）
     private String replaceBooleanLiterals(String sql) {
-        // 1. 排除单引号字符串内的 true/false 替换
         StringBuilder sb = new StringBuilder();
         boolean inString = false;
-        int len = sql.length();
+        int i = 0;
 
-        for (int i = 0; i < len; i++) {
+        while (i < sql.length()) {
             char ch = sql.charAt(i);
             if (ch == '\'') {
                 sb.append(ch);
-                // 检查是否是转义的单引号
-                if (i + 1 < len && sql.charAt(i + 1) == '\'') {
-                    // 双单引号，转义
+                i++;
+                // 跳过整个字符串
+                while (i < sql.length() && sql.charAt(i) != '\'') {
+                    sb.append(sql.charAt(i++));
+                }
+                if (i < sql.length()) {
                     sb.append('\'');
                     i++;
-                    continue;
                 }
-                inString = !inString;
                 continue;
             }
 
             if (!inString) {
-                // 检查 true/false 单词（只替换完整词且区分大小写）
-                if ((i + 4 <= len && sql.substring(i, i + 4).equalsIgnoreCase("true")) &&
-                        (i + 4 == len || !Character.isLetterOrDigit(sql.charAt(i + 4))) &&
-                        (i == 0 || !Character.isLetterOrDigit(sql.charAt(i - 1)))) {
+                // 匹配 true/false 单词
+                if (i + 4 <= sql.length() && sql.substring(i, i + 4).equalsIgnoreCase("true") &&
+                        (i == 0 || !Character.isLetterOrDigit(sql.charAt(i - 1))) &&
+                        (i + 4 == sql.length() || !Character.isLetterOrDigit(sql.charAt(i + 4)))) {
                     sb.append("Y");
-                    i += 3;
+                    i += 4;
                     continue;
                 }
-                if ((i + 5 <= len && sql.substring(i, i + 5).equalsIgnoreCase("false")) &&
-                        (i + 5 == len || !Character.isLetterOrDigit(sql.charAt(i + 5))) &&
-                        (i == 0 || !Character.isLetterOrDigit(sql.charAt(i - 1)))) {
+                if (i + 5 <= sql.length() && sql.substring(i, i + 5).equalsIgnoreCase("false") &&
+                        (i == 0 || !Character.isLetterOrDigit(sql.charAt(i - 1))) &&
+                        (i + 5 == sql.length() || !Character.isLetterOrDigit(sql.charAt(i + 5)))) {
                     sb.append("N");
-                    i += 4;
+                    i += 5;
                     continue;
                 }
             }
 
             sb.append(ch);
+            i++;
         }
 
         return sb.toString();
     }
 
-    // 新增工具方法：大写WHERE条件表达式的属性名（不影响字符串常量及部分SQL关键字）
+    // 工具方法：大写 WHERE 中的列名（跳过关键字和函数）
     private String uppercaseWhereColumnNames(String sql) {
-        // 正则提取SQL标识符(列名)并大写，忽略字符串中的内容
-        // 本实现简单保守，仅针对通常格式的列名/表名.列名进行大写，跳过function/数字/带引号情况
         StringBuilder sb = new StringBuilder();
         boolean inString = false;
-        int len = sql.length();
         int i = 0;
-        while (i < len) {
+
+        while (i < sql.length()) {
             char ch = sql.charAt(i);
             if (ch == '\'') {
                 sb.append(ch);
                 i++;
-                // 跳过整个字符串字面量
-                while (i < len) {
-                    char cc = sql.charAt(i);
-                    sb.append(cc);
-                    if (cc == '\'') {
-                        if (i + 1 < len && sql.charAt(i + 1) == '\'') {
-                            sb.append('\''); i += 2; continue;
-                        } else {
-                            i++; break;
-                        }
-                    }
+                while (i < sql.length() && sql.charAt(i) != '\'') {
+                    sb.append(sql.charAt(i++));
+                }
+                if (i < sql.length()) {
+                    sb.append('\'');
                     i++;
                 }
                 continue;
             }
-            // 检查.前的token或独立字段名
+
             if (Character.isJavaIdentifierStart(ch)) {
                 int start = i;
                 int end = i + 1;
-                while (end < len && Character.isJavaIdentifierPart(sql.charAt(end))) end++;
+                while (end < sql.length() && Character.isJavaIdentifierPart(sql.charAt(end))) {
+                    end++;
+                }
                 String token = sql.substring(start, end);
-                // 判断是否是函数名 （紧跟左括号）、SQL关键字跳过
-                boolean isFunc = (end < len && sql.charAt(end) == '(');
-                String keyword = token.toUpperCase();
-                // 不大写SQL常用关键字（可扩展）
-                if (
-                        "AND".equals(keyword) ||
-                                "OR".equals(keyword) ||
-                                "NOT".equals(keyword) ||
-                                "IS".equals(keyword) ||
-                                "IN".equals(keyword) ||
-                                "LIKE".equals(keyword) ||
-                                "BETWEEN".equals(keyword) ||
-                                "NULL".equals(keyword) ||
-                                "EXISTS".equals(keyword) ||
-                                "TRUE".equals(keyword) ||
-                                "FALSE".equals(keyword)
-                ) {
+
+                // 检查是否是函数（紧跟 '('）
+                boolean isFunc = end < sql.length() && sql.charAt(end) == '(';
+
+                // SQL 关键字不转大写
+                if (isKeyword(token)) {
                     sb.append(token);
-                    i = end;
-                    continue;
-                }
-                if (!isFunc) {
-                    // 检查是否 table.col 形式
-                    if (end < len && sql.charAt(end) == '.') {
-                        int j = end + 1;
-                        if (j < len && Character.isJavaIdentifierStart(sql.charAt(j))) {
-                            int idStart = j;
-                            int idEnd = idStart + 1;
-                            while (idEnd < len && Character.isJavaIdentifierPart(sql.charAt(idEnd))) idEnd++;
-                            String tname = token.toUpperCase();
-                            String cname = sql.substring(idStart, idEnd).toUpperCase();
-                            sb.append(tname).append('.').append(cname);
-                            i = idEnd;
-                            continue;
+                } else if (isFunc) {
+                    sb.append(token);
+                } else {
+                    // 检查是否为 table.col 形式
+                    if (end < sql.length() && sql.charAt(end) == '.') {
+                        int dotEnd = end + 1;
+                        while (dotEnd < sql.length() && Character.isJavaIdentifierPart(sql.charAt(dotEnd))) {
+                            dotEnd++;
                         }
+                        String tname = token.toUpperCase();
+                        String cname = sql.substring(end + 1, dotEnd).toUpperCase();
+                        sb.append(tname).append('.').append(cname);
+                        i = dotEnd;
+                        continue;
                     }
-                    // 普通列名
                     sb.append(token.toUpperCase());
-                    i = end;
-                    continue;
                 }
-                sb.append(token);
                 i = end;
                 continue;
-            } else {
-                sb.append(ch); i++;
             }
+
+            sb.append(ch);
+            i++;
         }
+
         return sb.toString();
     }
 
-    // 处理 CREATE TABLE（核心差异：自增、字段类型、默认值、字段名大写，无需加引号，UNIQUE/NOT NULL约束处理）
-    @Override
-    public void visit(CreateTable createTable) {
-        String tableName = createTable.getTable().getName().toUpperCase();
-        oracleSql.append("CREATE TABLE ").append(tableName).append(" (\n");
-
-        List<ColumnDefinition> columns = createTable.getColumnDefinitions();
-
-        // 收集需要在末尾添加的unique约束
-        StringBuilder uniqueConstraints = new StringBuilder();
-
-        for (int i = 0; i < columns.size(); i++) {
-            ColumnDefinition col = columns.get(i);
-
-            if (i != 0) {
-                oracleSql.append(",\n");
-            }
-
-            String colName = col.getColumnName().toUpperCase();
-            String colType = convertColumnType(col.getColDataType().getDataType(), col.getColDataType().getArgumentsStringList());
-
-            // JSQLParser 4.x 以后没有 getColumnSpecStrings，使用 getColumnSpecs（通常是 List<?> 或 List<Object>）
-            List<?> specStrings = null;
-            try {
-                specStrings = (List<?>) col.getClass().getMethod("getColumnSpecs").invoke(col);
-            } catch (Exception e) {
-                // 如果没有此方法或调用异常，则解析特殊属性时跳过
-            }
-
-            boolean isAutoIncrement = false;
-            boolean isPrimaryKey = false;
-            boolean isNotNull = false;
-            boolean isUnique = false;
-            String defaultValStr = null;
-
-            if (specStrings != null) {
-                for (int j = 0; j < specStrings.size(); j++) {
-                    Object obj = specStrings.get(j);
-                    if (obj instanceof String) {
-                        String s = ((String) obj).toUpperCase();
-                        if ("AUTO_INCREMENT".equals(s)) {
-                            isAutoIncrement = true;
-                        }
-                        if ("PRIMARY".equals(s) && (j + 1 < specStrings.size())) {
-                            Object nextObj = specStrings.get(j + 1);
-                            if (nextObj instanceof String
-                                    && "KEY".equalsIgnoreCase(((String) nextObj))) {
-                                isPrimaryKey = true;
-                            }
-                        }
-                        if ("NOT".equals(s) && (j + 1 < specStrings.size())) {
-                            Object nextObj = specStrings.get(j + 1);
-                            if (nextObj instanceof String
-                                    && "NULL".equalsIgnoreCase(((String) nextObj))) {
-                                isNotNull = true;
-                            }
-                        }
-                        if ("DEFAULT".equals(s) && (j + 1 < specStrings.size())) {
-                            Object nextObj = specStrings.get(j + 1);
-                            if (nextObj instanceof String) {
-                                defaultValStr = (String) nextObj;
-                            }
-                        }
-                        if ("UNIQUE".equals(s)) {
-                            isUnique = true;
-                        }
-                    }
-                }
-            }
-
-            // 字段名无需加双引号，只需大写即可
-            oracleSql.append("    ").append(colName).append(" ").append(colType);
-
-            // identity/auto_increment转Oracle方式
-            if (isAutoIncrement) {
-                oracleSql.append(" GENERATED BY DEFAULT AS IDENTITY");
-            }
-
-            // 默认值支持
-            if (defaultValStr != null) {
-                if (defaultValStr.toUpperCase().contains("CURRENT_TIMESTAMP")) {
-                    // DATETIME/DATE的CURRENT_TIMESTAMP
-                    oracleSql.append(" DEFAULT SYSDATE");
-                } else if (colType.equalsIgnoreCase("VARCHAR2(1)") &&
-                        (defaultValStr.equalsIgnoreCase("true") || defaultValStr.equalsIgnoreCase("false"))) {
-                    // 对于bool/boolean类型（Oracle用VARCHAR2(1)），用'Y'或'N'
-                    if (defaultValStr.equalsIgnoreCase("true")) {
-                        oracleSql.append(" DEFAULT Y");
-                    } else {
-                        oracleSql.append(" DEFAULT N");
-                    }
-                } else {
-                    oracleSql.append(" DEFAULT ").append(defaultValStr);
-                }
-            } else {
-                // 对于bool/boolean字段,给默认 'Y'
-                if (colType.equalsIgnoreCase("VARCHAR2(1)")) {
-                    oracleSql.append(" DEFAULT 'Y'");
-                }
-            }
-
-            // NOT NULL（一般不用加在自增主键上）
-            if (isNotNull && !(isPrimaryKey && isAutoIncrement)) {
-                oracleSql.append(" NOT NULL");
-            }
-
-            // PRIMARY KEY
-            if (isPrimaryKey) {
-                oracleSql.append(" PRIMARY KEY");
-            }
-
-            // UNIQUE 约束移到表级，确实 unique+not null都要体现
-            if (isUnique) {
-                if (uniqueConstraints.length() > 0) {
-                    uniqueConstraints.append(",\n");
-                }
-                uniqueConstraints.append("    CONSTRAINT UK_")
-                        .append(tableName)
-                        .append("_")
-                        .append(colName)
-                        .append(" UNIQUE(")
-                        .append(colName)
-                        .append(")");
-            }
-        }
-
-        // 添加表级unique约束
-        if (uniqueConstraints.length() > 0) {
-            oracleSql.append(",\n");
-            oracleSql.append(uniqueConstraints);
-        }
-
-        oracleSql.append("\n);\n\n");
+    // 判断是否为 SQL 关键字
+    private boolean isKeyword(String token) {
+        return Arrays.asList("AND", "OR", "NOT", "IS", "IN", "LIKE", "BETWEEN", "NULL", "EXISTS", "TRUE", "FALSE")
+                .contains(token.toUpperCase());
     }
 
-    // 处理索引 CREATE INDEX、UNIQUE INDEX 语句转换
-    @Override
-    public void visit(CreateIndex createIndex) {
-        String indexName = createIndex.getIndex().getName().toUpperCase();
-        String tableName = createIndex.getTable().getName().toUpperCase();
-        boolean isUnique = false;
+    // 工具方法：处理 WHERE 条件表达式
+    private String processWhereExpression(Expression where) {
+        if (where == null) return "";
+        String expr = where.toString();
+        expr = expr.replace("CURRENT_TIMESTAMP", "SYSDATE");
+        expr = replaceBooleanLiterals(expr);
+        expr = uppercaseWhereColumnNames(expr);
+        return " WHERE " + expr;
+    }
 
-        // 兼容 MySQL/JSQLParser 的 UNIQUE 索引类型，通过 SQL 解析 type 字符串和索引名是否以 'UNIQUE_' 开头
-        // 注意：JSQLParser 不同版本 CreateIndex 结构变动较大，不要直接调用 getType/isUnique
-        String idxAttrString = createIndex.toString().toUpperCase();
-        // 最保险判断法：SQL片段是否带有 'CREATE UNIQUE INDEX ...'
-        // 或者索引名本身带 UNIQUE 字样
-        if (idxAttrString.contains("CREATE UNIQUE INDEX")
-                || (indexName != null && indexName.startsWith("UNIQUE_"))) {
-            isUnique = true;
+    // 工具方法：提取注释内容（兼容COMMENT 'xxx'和COMMENT="xxx"等）
+    private String extractCommentFromSpecs(List<String> specs) {
+        if (specs == null) return null;
+        for (int i = 0; i < specs.size(); i++) {
+            String token = specs.get(i);
+            String lct = token.toLowerCase();
+            if (lct.equals("comment") && i + 1 < specs.size()) {
+                String val = specs.get(i+1);
+                // 去除引号
+                if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith("\"") && val.endsWith("\""))) {
+                    val = val.substring(1, val.length()-1);
+                }
+                return val;
+            }
+            // 有些情况下 COMMENT='value' 紧凑在一个token
+            if (lct.startsWith("comment=") || lct.startsWith("comment'") || lct.startsWith("comment\"")) {
+                int eqIdx = token.indexOf('=');
+                if (eqIdx >= 0 && eqIdx+1 < token.length()) {
+                    String val = token.substring(eqIdx+1);
+                    if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith("\"") && val.endsWith("\""))) {
+                        val = val.substring(1, val.length()-1);
+                    }
+                    return val;
+                }
+            }
         }
+        return null;
+    }
 
-        // 不能直接使用 getColumnsNames 方法，使用反射或直接访问字段
-        List<?> columnsList = null;
+    // 工具方法：提取表的注释（获取CREATE TABLE末尾的COMMENT='xxx'）
+    private String extractTableComment(CreateTable createTable) {
+        // 方法1：直接访问 tableOptionsStrings
         try {
-            // 1. 尝试 getColumns (标准API 是 getColumns())
-            columnsList = (List<?>) createIndex.getClass().getMethod("getColumns").invoke(createIndex);
-        } catch (Exception e) {
-            try {
-                // 2. 尝试直接取 public 字段
-                columnsList = (List<?>) createIndex.getClass().getField("columnsNames").get(createIndex);
-            } catch (Exception ex) {
-                // 失败则为空
-                columnsList = null;
-            }
-        }
-        String columns = "";
-        if (columnsList != null && !columnsList.isEmpty()) {
-            // 兼容可能的类型：Column, String
-            columns = columnsList.stream()
-                    .map(obj -> {
-                        if (obj instanceof Column) {
-                            return ((Column) obj).getColumnName().toUpperCase();
-                        } else {
-                            return obj.toString().toUpperCase();
+            java.lang.reflect.Method getOptionsMethod = CreateTable.class.getMethod("getTableOptionsStrings");
+            List<String> tableOptions = (List<String>) getOptionsMethod.invoke(createTable);
+
+            if (tableOptions != null && !tableOptions.isEmpty()) {
+                // 根据你提供的结构：["COMMENT", "=", "'用户基础信息表'"]
+                // 查找 COMMENT 关键字
+                for (int i = 0; i < tableOptions.size(); i++) {
+                    String option = tableOptions.get(i);
+                    if ("COMMENT".equalsIgnoreCase(option.trim())) {
+                        // 检查后面是否有 = 号
+                        if (i + 2 < tableOptions.size()) {
+                            String nextOption = tableOptions.get(i + 1);
+                            if ("=".equals(nextOption.trim())) {
+                                // 返回注释内容（去掉可能的引号）
+                                String comment = tableOptions.get(i + 2);
+                                return comment.trim();
+                            }
                         }
-                    })
-                    .collect(Collectors.joining(", "));
-        }
+                        // 如果没有 = 号，直接取下一个作为注释
+                        if (i + 1 < tableOptions.size()) {
+                            String comment = tableOptions.get(i + 1);
+                            return comment.trim();
+                        }
+                    }
+                }
 
-        oracleSql.append("CREATE");
-        if (isUnique) {
-            oracleSql.append(" UNIQUE");
-        }
-        oracleSql.append(" INDEX ").append(indexName);
-        oracleSql.append(" ON ").append(tableName);
-        oracleSql.append(" (").append(columns).append(");\n\n");
-    }
+                // 如果没有找到 COMMENT 关键字，检查是否有 = 号连接的注释
+                for (int i = 0; i < tableOptions.size(); i++) {
+                    String option = tableOptions.get(i);
+                    if ("=".equals(option.trim()) && i > 0 && i + 1 < tableOptions.size()) {
+                        String prevOption = tableOptions.get(i - 1);
+                        String nextOption = tableOptions.get(i + 1);
+                        if ("COMMENT".equalsIgnoreCase(prevOption.trim())) {
+                            return nextOption.trim();
+                        }
+                    }
+                }
 
-    // 处理 INSERT（表名字段名均需加双引号，且大写，日期函数替换）
-    @Override
-    public void visit(Insert insert) {
-        // 表名去掉MySQL反引号和单引号只保留大写
-        String tableNameRaw = insert.getTable().getName();
-        String tableName = tableNameRaw.replaceAll("^[`'\"]+|[`'\"]+$", "").toUpperCase();
-        oracleSql.append("INSERT INTO ").append(tableName);
-
-        List<Column> columns = insert.getColumns();
-        if (columns != null && !columns.isEmpty()) {
-            oracleSql.append("(");
-            for (int i = 0; i < columns.size(); i++) {
-                // 字段处理：清除包裹的反引号和单引号，只剩大写
-                String rawColName = columns.get(i).getColumnName();
-                String colName = rawColName.replaceAll("^[`'\"]+|[`'\"]+$", "").toUpperCase();
-                oracleSql.append(colName);
-                if (i < columns.size() - 1) oracleSql.append(", ");
+                // 尝试直接查找包含单引号的内容作为注释
+                for (String option : tableOptions) {
+                    if ((option.contains("'") || option.contains("\"")) &&
+                            option.length() > 2) { // 至少有一个字符加上两个引号
+                        return option.trim();
+                    }
+                }
             }
-            oracleSql.append(")");
+        } catch (Exception e) {
+            // 忽略异常，尝试其他方法
         }
 
-        // values部分直接取原始SQL并智能替换
-        String insertStr = insert.toString();
-        int valuesIdx = insertStr.toUpperCase().indexOf("VALUES");
-        String valuesPart = "";
-        if (valuesIdx != -1) {
-            valuesPart = insertStr.substring(valuesIdx + 6)
-                    .replace("CURRENT_TIMESTAMP", "SYSDATE");
-            valuesPart = replaceBooleanLiterals(valuesPart);
-        }
-        oracleSql.append(" VALUES").append(valuesPart).append(";\n\n");
-    }
+        // 方法2：从 toString() 解析
+        String createStr = createTable.toString();
 
-    // 新增：处理 DELETE
-    @Override
-    public void visit(Delete delete) {
-        // 表名去掉MySQL的`和'只保留大写
-        String tableNameRaw = delete.getTable().getName();
-        String tableName = tableNameRaw.replaceAll("^[`'\"]+|[`'\"]+$", "").toUpperCase();
-        oracleSql.append("DELETE FROM ").append(tableName);
-        // WHERE 条件
-        Expression where = delete.getWhere();
-        if (where != null) {
-            // 尝试保留原生SQL语句的where部份，替换CURRENT_TIMESTAMP、true/false，并大写属性名
-            String whereStr = where.toString().replace("CURRENT_TIMESTAMP", "SYSDATE");
-            whereStr = replaceBooleanLiterals(whereStr);
-            whereStr = uppercaseWhereColumnNames(whereStr);
-            oracleSql.append(" WHERE ").append(whereStr);
-        }
-        oracleSql.append(";\n\n");
-    }
+        // 先检查常见的注释格式
+        Pattern[] patterns = {
+                Pattern.compile("COMMENT\\s*=\\s*['\"]([^'\"]+)['\"]", Pattern.CASE_INSENSITIVE),
+                Pattern.compile("COMMENT\\s*['\"]([^'\"]+)['\"]", Pattern.CASE_INSENSITIVE),
+                Pattern.compile("COMMENT\\s*=\\s*([^,;)]+)", Pattern.CASE_INSENSITIVE),
+                Pattern.compile("COMMENT\\s+([^,;)]+)", Pattern.CASE_INSENSITIVE)
+        };
 
-    // 新增：处理 UPDATE
-    @Override
-    public void visit(Update update) {
-        // 表名去掉MySQL的`和'只保留大写
-        String tableNameRaw = update.getTable().getName();
-        String tableName = tableNameRaw.replaceAll("^[`'\"]+|[`'\"]+$", "").toUpperCase();
-        oracleSql.append("UPDATE ").append(tableName).append(" SET ");
-
-        List<Column> columns = update.getColumns();
-        List<Expression> expressions = update.getExpressions();
-        for (int i = 0; i < columns.size(); i++) {
-            String rawColName = columns.get(i).getColumnName();
-            String colName = rawColName.replaceAll("^[`'\"]+|[`'\"]+$", "").toUpperCase();
-            String valueExpr = expressions.get(i).toString().replace("CURRENT_TIMESTAMP", "SYSDATE");
-            valueExpr = replaceBooleanLiterals(valueExpr);
-            valueExpr = uppercaseWhereColumnNames(valueExpr);
-            oracleSql.append(colName).append("=").append(valueExpr);
-            if (i < columns.size() - 1) {
-                oracleSql.append(", ");
+        for (Pattern pattern : patterns) {
+            Matcher matcher = pattern.matcher(createStr);
+            if (matcher.find()) {
+                String comment = matcher.group(1).trim();
+                // 如果找到的注释包含引号，去掉它们
+                if ((comment.startsWith("'") && comment.endsWith("'")) ||
+                        (comment.startsWith("\"") && comment.endsWith("\""))) {
+                    comment = comment.substring(1, comment.length() - 1);
+                }
+                return comment;
             }
         }
 
-        Expression where = update.getWhere();
-        if (where != null) {
-            String whereStr = where.toString().replace("CURRENT_TIMESTAMP", "SYSDATE");
-            whereStr = replaceBooleanLiterals(whereStr);
-            whereStr = uppercaseWhereColumnNames(whereStr);
-            oracleSql.append(" WHERE ").append(whereStr);
+        // 方法3：检查是否存在注释相关的部分
+        String[] lines = createStr.split("\n");
+        for (String line : lines) {
+            if (line.trim().toUpperCase().contains("COMMENT")) {
+                String cleanLine = line.trim();
+                int commentIndex = cleanLine.toUpperCase().indexOf("COMMENT");
+                if (commentIndex != -1) {
+                    String afterComment = cleanLine.substring(commentIndex + "COMMENT".length()).trim();
+                    // 移除可能的 = 号
+                    if (afterComment.startsWith("=")) {
+                        afterComment = afterComment.substring(1).trim();
+                    }
+                    // 移除引号
+                    if ((afterComment.startsWith("'") && afterComment.endsWith("'")) ||
+                            (afterComment.startsWith("\"") && afterComment.endsWith("\""))) {
+                        return afterComment.substring(1, afterComment.length() - 1);
+                    }
+                    return afterComment;
+                }
+            }
         }
-        oracleSql.append(";\n\n");
+        return null;
     }
-
-    // 字段类型映射：带长度支持
+    // 字段类型转换
     private String convertColumnType(String mysqlType, List<?> args) {
         String type = mysqlType.toUpperCase();
         switch (type) {
@@ -431,11 +292,9 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
             case "VARCHAR":
                 if (args != null && !args.isEmpty()) {
                     return "VARCHAR2(" + args.get(0) + ")";
-                } else {
-                    return "VARCHAR2";
                 }
+                return "VARCHAR2";
             case "DATETIME":
-                return "DATE";
             case "TIMESTAMP":
                 return "DATE";
             case "BIGINT":
@@ -445,8 +304,18 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
             case "BOOLEAN":
             case "BOOL":
                 return "VARCHAR2(1)";
+            case "TEXT":
+            case "LONGTEXT":
+            case "MEDIUMTEXT":
+            case "TINYTEXT":
+                return "CLOB";
+            case "FLOAT":
+                return "NUMBER(10,2)";
+            case "DOUBLE":
+                return "NUMBER(18,4)";
+            case "DECIMAL":
+                return "NUMBER";
             default:
-                // 若类型带参数
                 if (args != null && !args.isEmpty()) {
                     return type + "(" + args.get(0) + ")";
                 }
@@ -454,7 +323,354 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         }
     }
 
-    // 获取转换后的 Oracle 脚本
+    // 处理 CREATE TABLE
+    @Override
+    public void visit(CreateTable createTable) {
+        String tableName = cleanIdentifier(createTable.getTable().getName());
+        oracleSql.append("CREATE TABLE ").append(tableName).append(" (\n");
+
+        List<ColumnDefinition> columns = createTable.getColumnDefinitions();
+
+        for (int i = 0; i < columns.size(); i++) {
+            ColumnDefinition col = columns.get(i);
+            if (i > 0) oracleSql.append(",\n");
+
+            String colName = cleanIdentifier(col.getColumnName());
+            String colType = convertColumnType(col.getColDataType().getDataType(),
+                    col.getColDataType().getArgumentsStringList());
+
+            // 解析 column spec - 修复方法
+            List<String> specs = new ArrayList<>();
+
+            // 方法1：使用 getColumnSpecStrings (如果可用)
+            try {
+                java.lang.reflect.Method method = ColumnDefinition.class.getMethod("getColumnSpecStrings");
+                Object result = method.invoke(col);
+                if (result instanceof List) {
+                    for (Object obj : (List<?>) result) {
+                        if (obj != null) {
+                            specs.add(obj.toString().trim());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // 方法2：改进的 toString 解析
+                String fullColStr = col.toString();
+
+                // 提取列定义部分（从列名开始到逗号或结尾）
+                String pattern = Pattern.quote(col.getColumnName()) + "\\s+.*?(?=,\\s*|$)";
+                Pattern r = Pattern.compile(pattern, Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+                Matcher m = r.matcher(fullColStr);
+
+                if (m.find()) {
+                    String columnDef = m.group();
+
+                    // 移除列名和数据类型，得到纯约束部分
+                    String colNamePattern = Pattern.quote(col.getColumnName());
+                    String dataTypePattern = Pattern.quote(col.getColDataType().getDataType());
+                    String constraintsOnly = columnDef
+                            .replaceFirst("^" + colNamePattern + "\\s+", "")
+                            .replaceFirst("^" + dataTypePattern + "\\s*", "")
+                            .trim();
+
+                    // 智能解析约束（处理括号、引号等）
+                    specs = parseConstraintTokens(constraintsOnly);
+                }
+            }
+
+            // 新增：从列规格中解析约束（如果可用）
+            try {
+                java.lang.reflect.Method getSpecsMethod = ColumnDefinition.class.getMethod("getColumnSpecifications");
+                Object specsObj = getSpecsMethod.invoke(col);
+                if (specsObj instanceof List) {
+                    for (Object specObj : (List<?>) specsObj) {
+                        if (specObj != null) {
+                            specs.add(specObj.toString().toUpperCase().trim());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // 忽略，不使用此方法
+            }
+
+            // 解析约束标志
+            boolean isAutoIncrement = false, isPrimaryKey = false,
+                    isNotNull = false, isUnique = false;
+            String defaultValStr = null;
+            String columnComment = null;
+
+            // 支持 UNIQUE、NOT NULL 出现在不同次序、方式
+            for (int j = 0; j < specs.size(); j++) {
+                String spec = specs.get(j).toUpperCase().trim();
+
+                // 检查两词组合
+                if (j + 1 < specs.size()) {
+                    String twoWordSpec = spec + " " + specs.get(j + 1).toUpperCase();
+                    if ("PRIMARY KEY".equals(twoWordSpec)) {
+                        isPrimaryKey = true;
+                        j++; // 跳过 KEY
+                        continue;
+                    }
+                    if ("NOT NULL".equals(twoWordSpec)) {
+                        isNotNull = true;
+                        j++; // 跳过 NULL
+                        continue;
+                    }
+                }
+
+                // 检查单词约束
+                if ("AUTO_INCREMENT".equals(spec) || "AUTOINCREMENT".equals(spec)) {
+                    isAutoIncrement = true;
+                } else if ("PRIMARY".equals(spec)) {
+                    // 单独的 PRIMARY 可能表示 PRIMARY KEY
+                    isPrimaryKey = true;
+                } else if ("KEY".equals(spec) && j > 0 && "PRIMARY".equals(specs.get(j-1).toUpperCase())) {
+                    // 已经处理过，跳过
+                } else if ("NOT".equals(spec)) {
+                    // 单独的 NOT 可能表示 NOT NULL
+                    isNotNull = true;
+                } else if ("NULL".equals(spec) && j > 0 && "NOT".equals(specs.get(j-1).toUpperCase())) {
+                    // 已经处理过，跳过
+                } else if ("UNIQUE".equals(spec)) {
+                    isUnique = true;
+                } else if ("DEFAULT".equals(spec) && j + 1 < specs.size()) {
+                    defaultValStr = specs.get(j + 1);
+                    j++; // 跳过默认值
+                } else if ("COMMENT".equals(spec) && j + 1 < specs.size()) {
+                    columnComment = specs.get(j + 1);
+                    j++; // 跳过注释内容
+                }
+            }
+
+            // 构建字段定义
+            oracleSql.append("    ").append(colName).append(" ").append(colType);
+
+            if (isAutoIncrement) {
+                oracleSql.append(" GENERATED BY DEFAULT AS IDENTITY");
+            }
+
+            if (defaultValStr != null) {
+                // 处理特殊默认值
+                defaultValStr = defaultValStr.trim();
+                if (defaultValStr.contains("CURRENT_TIMESTAMP")) {
+                    oracleSql.append(" DEFAULT SYSDATE");
+                } else if (colType.equalsIgnoreCase("VARCHAR2(1)") &&
+                        (defaultValStr.equalsIgnoreCase("true") || defaultValStr.equalsIgnoreCase("false"))) {
+                    oracleSql.append(" DEFAULT '").append(defaultValStr.equalsIgnoreCase("true") ? "Y" : "N").append("'");
+                } else if (defaultValStr.startsWith("'") && defaultValStr.endsWith("'")) {
+                    // 带引号的字符串
+                    oracleSql.append(" DEFAULT ").append(defaultValStr);
+                } else {
+                    // 数字或其他值
+                    oracleSql.append(" DEFAULT ").append(defaultValStr);
+                }
+            } else if (colType.equalsIgnoreCase("VARCHAR2(1)")) {
+                oracleSql.append(" DEFAULT 'Y'");
+            }
+
+            // 约束顺序：主键 > 唯一 > 非空
+            if (isPrimaryKey) {
+                oracleSql.append(" PRIMARY KEY");
+            } else {
+                if (isUnique) {
+                    oracleSql.append(" UNIQUE");
+                }
+                if (isNotNull) {
+                    oracleSql.append(" NOT NULL");
+                }
+            }
+
+            // 处理字段注释
+            if (columnComment != null && !columnComment.isEmpty()) {
+                // 移除可能的引号
+                columnComment = columnComment.replaceAll("^['\"]|['\"]$", "");
+                comments.add("COMMENT ON COLUMN " + tableName + "." + colName +
+                        " IS '" + columnComment.replace("'", "''") + "';\n");
+            }
+
+        }
+
+        oracleSql.append("\n);\n\n");
+
+        // 表级注释处理 - 修复方法
+        String tableComment = extractTableComment(createTable);
+        if (tableComment != null && !tableComment.isEmpty()) {
+            // 确保注释字符串格式正确
+            tableComment = tableComment.trim();
+            // 移除可能的多余引号
+            if (tableComment.startsWith("'") && tableComment.endsWith("'")) {
+                tableComment = tableComment.substring(1, tableComment.length() - 1);
+            } else if (tableComment.startsWith("\"") && tableComment.endsWith("\"")) {
+                tableComment = tableComment.substring(1, tableComment.length() - 1);
+            }
+            // 转义单引号
+            tableComment = tableComment.replace("'", "''");
+            comments.add("COMMENT ON TABLE " + tableName + " IS '" + tableComment + "';\n");
+        }
+
+        // 添加所有comment语句（表及字段）
+        if (!comments.isEmpty()) {
+            for (String cmt : comments) {
+                oracleSql.append(cmt);
+            }
+            comments.clear();
+        }
+    }
+
+    // 辅助方法：智能解析约束令牌
+    private List<String> parseConstraintTokens(String input) {
+        List<String> tokens = new ArrayList<>();
+        if (input == null || input.trim().isEmpty()) {
+            return tokens;
+        }
+
+        StringBuilder currentToken = new StringBuilder();
+        boolean inSingleQuotes = false;
+        boolean inDoubleQuotes = false;
+        boolean inParentheses = false;
+        int parenDepth = 0;
+
+        for (int i = 0; i < input.length(); i++) {
+            char c = input.charAt(i);
+
+            if (c == '\'' && (i == 0 || input.charAt(i-1) != '\\')) {
+                inSingleQuotes = !inSingleQuotes;
+                currentToken.append(c);
+            } else if (c == '"' && (i == 0 || input.charAt(i-1) != '\\')) {
+                inDoubleQuotes = !inDoubleQuotes;
+                currentToken.append(c);
+            } else if (c == '(' && !inSingleQuotes && !inDoubleQuotes) {
+                inParentheses = true;
+                parenDepth++;
+                currentToken.append(c);
+            } else if (c == ')' && !inSingleQuotes && !inDoubleQuotes && inParentheses) {
+                parenDepth--;
+                if (parenDepth == 0) {
+                    inParentheses = false;
+                }
+                currentToken.append(c);
+            } else if ((c == ' ' || c == ',') && !inSingleQuotes && !inDoubleQuotes && !inParentheses) {
+                if (currentToken.length() > 0) {
+                    tokens.add(currentToken.toString().trim());
+                    currentToken = new StringBuilder();
+                }
+            } else {
+                currentToken.append(c);
+            }
+        }
+
+        // 添加最后一个token
+        if (currentToken.length() > 0) {
+            tokens.add(currentToken.toString().trim());
+        }
+
+        return tokens;
+    }
+
+
+    // 处理 CREATE INDEX
+    @Override
+    public void visit(CreateIndex createIndex) {
+        String indexName = cleanIdentifier(createIndex.getIndex().getName());
+        String tableName = cleanIdentifier(createIndex.getTable().getName());
+        boolean isUnique = createIndex.toString().toUpperCase().contains("UNIQUE") ||
+                (indexName != null && indexName.startsWith("UNIQUE_"));
+
+        // getColumns() 不存在时，尝试解析 toString()
+        List<String> columns = new ArrayList<>();
+        List<?> colsObj = null;
+        try {
+            colsObj = (List<?>)CreateIndex.class.getMethod("getColumns").invoke(createIndex);
+        } catch (Exception e) {
+            // getColumns() 方法不存在，尝试解析 SQL 字符串
+            String idxStr = createIndex.toString();
+            int lpar = idxStr.indexOf('(');
+            int rpar = idxStr.indexOf(')', lpar);
+            if (lpar != -1 && rpar != -1) {
+                String inParens = idxStr.substring(lpar + 1, rpar);
+                String[] colArr = inParens.split(",");
+                for (String raw : colArr) {
+                    String clean = raw.trim().replaceAll("[`'\"]", "");
+                    if (!clean.isEmpty()) columns.add(clean.toUpperCase());
+                }
+            }
+        }
+        if (colsObj != null) {
+            for (Object col : colsObj) {
+                if (col instanceof Column) {
+                    columns.add(cleanIdentifier(((Column) col).getColumnName()));
+                } else if (col instanceof String) {
+                    columns.add(cleanIdentifier((String) col));
+                }
+            }
+        }
+
+        oracleSql.append("CREATE");
+        if (isUnique) oracleSql.append(" UNIQUE");
+        oracleSql.append(" INDEX ").append(indexName)
+                .append(" ON ").append(tableName)
+                .append(" (").append(String.join(", ", columns)).append(");\n\n");
+    }
+
+    // 处理 INSERT
+    @Override
+    public void visit(Insert insert) {
+        String tableName = cleanIdentifier(insert.getTable().getName());
+        oracleSql.append("INSERT INTO ").append(tableName);
+
+        List<Column> columns = insert.getColumns();
+        if (columns != null && !columns.isEmpty()) {
+            oracleSql.append("(");
+            for (int i = 0; i < columns.size(); i++) {
+                String colName = cleanIdentifier(columns.get(i).getColumnName());
+                oracleSql.append(colName);
+                if (i < columns.size() - 1) oracleSql.append(", ");
+            }
+            oracleSql.append(")");
+        }
+
+        String valuesStr = insert.toString().toUpperCase();
+        int valuesIdx = valuesStr.indexOf("VALUES");
+        String valuesPart = "";
+        if (valuesIdx != -1) {
+            valuesPart = insert.toString().substring(valuesIdx + 6);
+            valuesPart = valuesPart.replace("CURRENT_TIMESTAMP", "SYSDATE");
+            valuesPart = replaceBooleanLiterals(valuesPart);
+        }
+
+        oracleSql.append(" VALUES").append(valuesPart).append(";\n\n");
+    }
+
+    // 处理 UPDATE
+    @Override
+    public void visit(Update update) {
+        String tableName = cleanIdentifier(update.getTable().getName());
+        oracleSql.append("UPDATE ").append(tableName).append(" SET ");
+
+        List<Column> cols = update.getColumns();
+        List<Expression> exprs = update.getExpressions();
+        for (int i = 0; i < cols.size(); i++) {
+            String colName = cleanIdentifier(cols.get(i).getColumnName());
+            String valueExpr = exprs.get(i).toString();
+            valueExpr = valueExpr.replace("CURRENT_TIMESTAMP", "SYSDATE");
+            valueExpr = replaceBooleanLiterals(valueExpr);
+            valueExpr = uppercaseWhereColumnNames(valueExpr);
+            oracleSql.append(colName).append("=").append(valueExpr);
+            if (i < cols.size() - 1) oracleSql.append(", ");
+        }
+
+        oracleSql.append(processWhereExpression(update.getWhere())).append(";\n\n");
+    }
+
+    // 处理 DELETE
+    @Override
+    public void visit(Delete delete) {
+        String tableName = cleanIdentifier(delete.getTable().getName());
+        oracleSql.append("DELETE FROM ").append(tableName);
+        oracleSql.append(processWhereExpression(delete.getWhere())).append(";\n\n");
+    }
+
+    // 获取最终 Oracle SQL
     public String getOracleSql() {
         return oracleSql.toString();
     }

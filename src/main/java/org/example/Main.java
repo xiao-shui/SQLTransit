@@ -4,6 +4,7 @@ import net.sf.jsqlparser.JSQLParserException;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import net.sf.jsqlparser.statement.Statement;
 import org.example.SqlTransitAI.tool.MysqlToOracleVisitor;
+import org.example.SqlTransitAI.tool.MysqlToPostgresqlVisitor;
 
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -35,10 +36,21 @@ public class Main {
             return;
         }
 
-        MysqlToOracleVisitor visitor = new MysqlToOracleVisitor();
-        for (Statement stmt : statements) {
-            stmt.accept(visitor);
+        MysqlToOracleVisitor oracleVisitorvisitor = new MysqlToOracleVisitor();
+        MysqlToPostgresqlVisitor postVisitorvisitor = new MysqlToPostgresqlVisitor();
+        System.out.print("请输入目标方言: ");
+        String name = scanner.nextLine();
+        if(name.toLowerCase().equals("oracle")){
+            for (Statement stmt : statements) {
+                stmt.accept(oracleVisitorvisitor);
+            }
+            System.out.println(oracleVisitorvisitor.getOracleSql());
+        }else if(name.toLowerCase().equals("postgresql")){
+            for (Statement stmt : statements) {
+                stmt.accept(oracleVisitorvisitor);
+            }
+            System.out.println(oracleVisitorvisitor.getOracleSql());
         }
-        System.out.println(visitor.getOracleSql());
+
     }
 }
