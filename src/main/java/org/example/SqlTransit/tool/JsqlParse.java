@@ -1,4 +1,4 @@
-package org.example.SqlTransitAI.tool;
+package org.example.SqlTransit.tool;
 
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import net.sf.jsqlparser.statement.Statement;
@@ -61,8 +61,7 @@ public class JsqlParse {
                     Object child = m.invoke(node);
                     if (child == null) continue;
                     // 集合类型，需要递归
-                    if (child instanceof Collection) {
-                        Collection<?> coll = (Collection<?>) child;
+                    if (child instanceof Collection<?> coll) {
                         if (coll.isEmpty()) continue;
                         printIndent(indent+1);
                         System.out.println("-- " + m.getName() + " --");

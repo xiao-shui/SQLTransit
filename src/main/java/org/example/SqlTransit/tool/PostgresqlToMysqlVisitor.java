@@ -21,7 +21,7 @@ import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class OracleToMysqlVisitor extends StatementVisitorAdapter {
+public class PostgresqlToMysqlVisitor extends StatementVisitorAdapter {
     private final StringBuilder mysqlSql = new StringBuilder();
 
     // 收集所有信息，最后统一输出
@@ -32,16 +32,6 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         List<String> uniqueKeys = new ArrayList<>();
         String tableComment;
         boolean hasTableDefinition = false;
-
-        // 获取字段信息，便于查找
-        ColumnInfo getColumnInfo(String columnName) {
-            for (ColumnInfo col : columns) {
-                if (col.name.equals(columnName)) {
-                    return col;
-                }
-            }
-            return null;
-        }
     }
 
     private static class ColumnInfo {
@@ -68,70 +58,93 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         return name.replaceAll("^[\"`']+|[\"`']+$", "").toLowerCase(Locale.ROOT).trim();
     }
 
-    private String convertDataType(String oracleType, List<String> args) {
-        if (oracleType == null) return "VARCHAR(255)";
-        String type = oracleType.toUpperCase(Locale.ROOT);
+    private String convertDataType(String postgresqlType, List<String> args) {
+        if (postgresqlType == null) return "VARCHAR(255)";
+        String type = postgresqlType.toUpperCase(Locale.ROOT);
+
         switch (type) {
-            case "NUMBER":
-                if (args != null && args.size() == 2) {
-                    return "DECIMAL(" + args.get(0) + "," + args.get(1) + ")";
-                } else if (args != null && args.size() == 1) {
-                    int precision = Integer.parseInt(args.get(0));
-                    if (precision <= 10) {
-                        return "INT";
-                    } else if (precision <= 19) {
-                        return "BIGINT";
-                    } else {
-                        return "DECIMAL(" + args.get(0) + ")";
-                    }
-                }
-                return "DECIMAL(10,2)";
-            case "VARCHAR2":
+            case "INTEGER":
+            case "INT":
+                return "INT";
+            case "SMALLINT":
+                return "SMALLINT";
+            case "BIGINT":
+                return "BIGINT";
+            case "SERIAL":
+                return "INT AUTO_INCREMENT";
+            case "BIGSERIAL":
+                return "BIGINT AUTO_INCREMENT";
+            case "VARCHAR":
                 if (args != null && !args.isEmpty()) {
                     return "VARCHAR(" + args.get(0) + ")";
                 }
                 return "VARCHAR(255)";
-            case "NVARCHAR2":
-                if (args != null && !args.isEmpty()) {
-                    return "VARCHAR(" + args.get(0) + ") CHARACTER SET utf8mb4";
-                }
-                return "VARCHAR(255) CHARACTER SET utf8mb4";
             case "CHAR":
+            case "CHARACTER":
                 if (args != null && !args.isEmpty()) {
                     return "CHAR(" + args.get(0) + ")";
                 }
                 return "CHAR(1)";
-            case "NCHAR":
-                if (args != null && !args.isEmpty()) {
-                    return "CHAR(" + args.get(0) + ") CHARACTER SET utf8mb4";
-                }
-                return "CHAR(1) CHARACTER SET utf8mb4";
-            case "DATE":
-                return "DATETIME";
-            case "TIMESTAMP":
-                return "DATETIME";
-            case "CLOB":
-            case "NCLOB":
-                return "LONGTEXT";
-            case "BLOB":
+            case "TEXT":
+                return "TEXT";
+            case "BYTEA":
                 return "LONGBLOB";
-            case "RAW":
-                if (args != null && !args.isEmpty()) {
-                    return "VARBINARY(" + args.get(0) + ")";
-                }
-                return "VARBINARY(255)";
-            case "LONG":
-                return "LONGTEXT";
-            case "FLOAT":
-                return "DOUBLE";
-            case "BINARY_FLOAT":
+            case "BOOLEAN":
+                return "BOOLEAN";
+            case "REAL":
                 return "FLOAT";
-            case "BINARY_DOUBLE":
+            case "DOUBLE PRECISION":
+            case "FLOAT8":
                 return "DOUBLE";
+            case "NUMERIC":
+            case "DECIMAL":
+                if (args != null && args.size() == 2) {
+                    return "DECIMAL(" + args.get(0) + "," + args.get(1) + ")";
+                } else if (args != null && !args.isEmpty()) {
+                    return "DECIMAL(" + args.get(0) + ")";
+                }
+                return "DECIMAL(10,2)";
+            case "DATE":
+                return "DATE";
+            case "TIMESTAMP":
+            case "TIMESTAMP WITHOUT TIME ZONE":
+                return "DATETIME";
+            case "TIMESTAMPTZ":
+            case "TIMESTAMP WITH TIME ZONE":
+                return "DATETIME";
+            case "TIME":
+                return "TIME";
             case "INTERVAL":
-                return "VARCHAR(50)";
-            case "XMLTYPE":
+                return "VARCHAR(100)";
+            case "MONEY":
+                return "DECIMAL(15,2)";
+            case "JSON":
+            case "JSONB":
+                return "JSON";
+            case "UUID":
+                return "VARCHAR(36)";
+            case "CIDR":
+            case "INET":
+            case "MACADDR":
+                return "VARCHAR(45)";
+            case "BIT":
+            case "BIT VARYING":
+                return "VARBINARY";
+            case "ARRAY":
+                return "TEXT"; // MySQL不支持数组，转为TEXT
+            case "XML":
                 return "LONGTEXT";
+            case "TSVECTOR":
+            case "TSQUERY":
+                return "TEXT";
+            case "POINT":
+            case "LINE":
+            case "LSEG":
+            case "BOX":
+            case "PATH":
+            case "POLYGON":
+            case "CIRCLE":
+                return "GEOMETRY"; // PostgreSQL几何类型转MySQL的GEOMETRY
             default:
                 if (args != null && !args.isEmpty()) {
                     return type + "(" + String.join(",", args) + ")";
@@ -142,6 +155,7 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
 
     @Override
     public void visit(CreateTable createTable) {
+        // 强制表名小写
         String tableName = cleanIdentifier(createTable.getTable().getName());
         TableInfo tableInfo = tables.computeIfAbsent(tableName, k -> new TableInfo());
         tableInfo.tableName = tableName;
@@ -156,6 +170,7 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
 
         for (ColumnDefinition col : columns) {
             ColumnInfo colInfo = new ColumnInfo();
+            // 强制字段名小写
             colInfo.name = cleanIdentifier(col.getColumnName());
             colInfo.type = convertDataType(
                     col.getColDataType().getDataType(),
@@ -187,8 +202,13 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                         j++;
                         continue;
                     }
+                    if ("FOREIGN KEY".equals(twoWords)) {
+                        j++; // 跳过KEY
+                        continue;
+                    }
                 }
 
+                // 处理PostgreSQL特有的约束
                 switch (specUpper) {
                     case "PRIMARY":
                         colInfo.isPrimaryKey = true;
@@ -215,19 +235,21 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                         break;
                     case "AUTO_INCREMENT":
                     case "IDENTITY":
-                        colInfo.isAutoIncrement = true;
-                        break;
                     case "GENERATED":
                         if (j + 2 < columnSpecs.size()
                                 && "BY".equalsIgnoreCase(columnSpecs.get(j + 1))
                                 && "DEFAULT".equalsIgnoreCase(columnSpecs.get(j + 2))) {
                             colInfo.isAutoIncrement = true;
                             j += 2;
+                        } else if ("ALWAYS".equalsIgnoreCase(specUpper) && j > 0
+                                && "GENERATED".equalsIgnoreCase(columnSpecs.get(j-1).toUpperCase(Locale.ROOT))) {
+                            colInfo.isAutoIncrement = true;
                         }
                         break;
-                    case "COMMENT":
-                        if (j + 1 < columnSpecs.size()) {
-                            colInfo.columnComment = cleanCommentValue(columnSpecs.get(j + 1));
+                    case "REFERENCES":
+                        // 外键约束，跳过参数
+                        while (j + 1 < columnSpecs.size() && !columnSpecs.get(j + 1).toUpperCase(Locale.ROOT)
+                                .matches("^(PRIMARY|UNIQUE|NOT|DEFAULT|CHECK|COMMENT)$")) {
                             j++;
                         }
                         break;
@@ -236,68 +258,75 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
 
             // 处理默认值转换
             if (colInfo.defaultValue != null) {
-                if (colInfo.defaultValue.toUpperCase(Locale.ROOT).contains("SYSDATE") ||
-                        colInfo.defaultValue.toUpperCase(Locale.ROOT).contains("CURRENT_TIMESTAMP")) {
+                String defaultValue = colInfo.defaultValue.toUpperCase(Locale.ROOT);
+                if (defaultValue.contains("CURRENT_TIMESTAMP") ||
+                        defaultValue.contains("NOW()") ||
+                        defaultValue.contains("CURRENT_DATE") ||
+                        defaultValue.contains("CURRENT_TIME")) {
                     colInfo.defaultValue = "CURRENT_TIMESTAMP";
-                } else if (colInfo.defaultValue.toUpperCase(Locale.ROOT).contains("NULL")) {
+                } else if (defaultValue.contains("TRUE") || defaultValue.contains("'T'") || defaultValue.contains("'t'")) {
+                    colInfo.defaultValue = "TRUE";
+                } else if (defaultValue.contains("FALSE") || defaultValue.contains("'F'") || defaultValue.contains("'f'")) {
+                    colInfo.defaultValue = "FALSE";
+                } else if (defaultValue.contains("NULL")) {
                     colInfo.defaultValue = "NULL";
                 }
+                // 移除PostgreSQL的类型转换::type
+                colInfo.defaultValue = colInfo.defaultValue.replaceAll("::\\w+", "");
             }
 
-            // 检查是否已经存在此字段（可能来自之前的 COMMENT ON COLUMN）
-            ColumnInfo existingCol = tableInfo.getColumnInfo(colInfo.name);
-            if (existingCol != null) {
-                // 合并字段信息：保留已有注释，更新其他属性
-                existingCol.type = colInfo.type;
-                existingCol.isPrimaryKey = colInfo.isPrimaryKey;
-                existingCol.isUnique = colInfo.isUnique;
-                existingCol.isNotNull = colInfo.isNotNull;
-                existingCol.isAutoIncrement = colInfo.isAutoIncrement;
-                existingCol.defaultValue = colInfo.defaultValue;
-                existingCol.checkConstraint = colInfo.checkConstraint;
-                // 如果当前有注释且已有注释为空，则使用当前注释
-                if (colInfo.columnComment != null && (existingCol.columnComment == null || existingCol.columnComment.isEmpty())) {
-                    existingCol.columnComment = colInfo.columnComment;
+            // 字段注释合并：如果在tableInfo已有注释（来自COMMENT ON COLUMN），则优先该注释
+            if (tableInfo.columns != null) {
+                for (ColumnInfo existCol : tableInfo.columns) {
+                    if (existCol.name.equals(colInfo.name) && existCol.columnComment != null) {
+                        colInfo.columnComment = existCol.columnComment;
+                        break;
+                    }
                 }
-            } else {
-                // 添加新字段信息
-                tableInfo.columns.add(colInfo);
             }
+            tableInfo.columns.add(colInfo);
         }
     }
 
     @Override
     public void visit(Comment comment) {
-        // 1. 获取注释内容
+        // PostgreSQL注释语法：COMMENT ON TABLE table_name IS 'comment'
+        // 或：COMMENT ON COLUMN table_name.column_name IS 'comment'
         String commentText = null;
-
         if (comment.getComment() instanceof StringValue) {
             StringValue stringValue = (StringValue) comment.getComment();
             commentText = stringValue.getValue().trim();
         } else if (comment.getComment() != null) {
             commentText = cleanCommentValue(comment.getComment().toString());
         }
-        if (commentText == null) commentText = "";
+        // 注释内容可以是空字符串，不能就跳过——MySQL允许空的COMMENT
+        if (commentText == null) {
+            commentText = "";
+        }
 
+        // 处理表注释/字段注释
         if (comment.getTable() != null) {
             String tableName = cleanIdentifier(comment.getTable().getName());
             TableInfo tableInfo = tables.computeIfAbsent(tableName, k -> new TableInfo());
             tableInfo.tableName = tableName;
 
-            // 2. 字段注释
             if (comment.getColumn() != null) {
+                // 字段注释：强制字段名小写
                 String columnName = cleanIdentifier(comment.getColumn().getColumnName());
-                ColumnInfo colInfo = tableInfo.getColumnInfo(columnName);
-                if (colInfo == null) {
-                    // 没找到，创建新字段信息（只有注释，其他属性后面会补充）
-                    colInfo = new ColumnInfo();
-                    colInfo.name = columnName;
-                    tableInfo.columns.add(colInfo);
-                }
+                // 确保列存在（兼容先注释后建表、也兼容先建表后注释的场景）
+                ColumnInfo colInfo = tableInfo.columns.stream()
+                        .filter(c -> c.name.equals(columnName))
+                        .findFirst()
+                        .orElseGet(() -> {
+                            ColumnInfo newCol = new ColumnInfo();
+                            newCol.name = columnName;
+                            newCol.type = "VARCHAR(255)";
+                            tableInfo.columns.add(newCol);
+                            return newCol;
+                        });
+                // 保存注释
                 colInfo.columnComment = commentText;
-                System.out.println("字段注解："+colInfo.columnComment);
             } else {
-                // 3. 表注释
                 tableInfo.tableComment = commentText;
             }
         }
@@ -305,16 +334,19 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
 
     @Override
     public void visit(Insert insert) {
+        // 收集INSERT语句，最后统一输出
         otherStatements.add(convertInsert(insert));
     }
 
     @Override
     public void visit(Update update) {
+        // 收集UPDATE语句，最后统一输出
         otherStatements.add(convertUpdate(update));
     }
 
     @Override
     public void visit(Delete delete) {
+        // 收集DELETE语句，最后统一输出
         otherStatements.add(convertDelete(delete));
     }
 
@@ -341,8 +373,8 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                     mysqlSql.append(" AUTO_INCREMENT");
                 }
 
-                if(col.isPrimaryKey){
-                    mysqlSql.append(" PRIMARY KEY ");
+                if (col.isPrimaryKey) {
+                    mysqlSql.append(" PRIMARY KEY");
                 }
 
                 if (col.isNotNull) {
@@ -354,19 +386,48 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                 }
 
                 if (col.checkConstraint != null && !col.checkConstraint.isEmpty()) {
-                    mysqlSql.append(" CHECK ").append(col.checkConstraint);
+                    // 转换PostgreSQL的CHECK约束语法
+                    String checkConstraint = col.checkConstraint;
+                    checkConstraint = checkConstraint.replaceAll("(?i)\\bTRUE\\b", "1");
+                    checkConstraint = checkConstraint.replaceAll("(?i)\\bFALSE\\b", "0");
+                    mysqlSql.append(" CHECK ").append(checkConstraint);
                 }
 
-                // 修复：始终添加字段注释（如果有）
-                if (col.columnComment != null && !col.columnComment.isEmpty()) {
+                // 始终加 COMMENT 子句（哪怕是空字符串）
+                if (col.columnComment != null) {
                     mysqlSql.append(" COMMENT '").append(escapeComment(col.columnComment)).append("'");
                 }
+            }
+
+            // 表级约束
+            boolean hasTableConstraint = false;
+
+            // 主键约束
+            if (!tableInfo.primaryKeys.isEmpty()) {
+                mysqlSql.append(",\n    PRIMARY KEY (");
+                for (int i = 0; i < tableInfo.primaryKeys.size(); i++) {
+                    if (i > 0) mysqlSql.append(", ");
+                    mysqlSql.append(tableInfo.primaryKeys.get(i));
+                }
+                mysqlSql.append(")");
+                hasTableConstraint = true;
+            }
+
+            // 唯一约束
+            if (!tableInfo.uniqueKeys.isEmpty()) {
+                mysqlSql.append(",\n    UNIQUE (");
+                for (int i = 0; i < tableInfo.uniqueKeys.size(); i++) {
+                    if (i > 0) mysqlSql.append(", ");
+                    mysqlSql.append(tableInfo.uniqueKeys.get(i));
+                }
+                mysqlSql.append(")");
+                hasTableConstraint = true;
             }
 
             mysqlSql.append("\n)");
 
             // 添加表注释
-            if (tableInfo.tableComment != null && !tableInfo.tableComment.isEmpty()) {
+            if (tableInfo.tableComment != null) {
                 mysqlSql.append(" COMMENT='").append(escapeComment(tableInfo.tableComment)).append("'");
             }
 
@@ -445,7 +506,7 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
 
         Expression where = update.getWhere();
         if (where != null) {
-            sb.append(" WHERE ").append(convertExpressionLowerColumn(where));
+            sb.append(" WHERE ").append(convertExpression(where));
         }
 
         return sb.append(";\n\n").toString();
@@ -458,153 +519,10 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
 
         Expression where = delete.getWhere();
         if (where != null) {
-            sb.append(" WHERE ").append(convertExpressionLowerColumn(where));
+            sb.append(" WHERE ").append(convertExpression(where));
         }
 
         return sb.append(";\n\n").toString();
-    }
-
-    /**
-     * where后的表达式内容列名全部小写
-     */
-    private String convertExpressionLowerColumn(Expression expression) {
-        if (expression == null) return "";
-
-        if (expression instanceof StringValue) {
-            StringValue strVal = (StringValue) expression;
-            return "'" + strVal.getValue().replace("'", "''") + "'";
-        }
-        if (expression instanceof LongValue) {
-            LongValue longVal = (LongValue) expression;
-            return String.valueOf(longVal.getValue());
-        }
-        if (expression instanceof DoubleValue) {
-            DoubleValue doubleVal = (DoubleValue) expression;
-            return String.valueOf(doubleVal.getValue());
-        }
-        if (expression instanceof DateValue) {
-            DateValue dateVal = (DateValue) expression;
-            return "'" + dateVal.getValue() + "'";
-        }
-        if (expression instanceof Function) {
-            Function function = (Function) expression;
-            String functionName = function.getName();
-            List<Expression> params = new ArrayList<>();
-
-            ExpressionList exprList = function.getParameters();
-            if (exprList != null) {
-                params = exprList.getExpressions();
-            }
-
-            // 特殊处理TO_DATE函数
-            if ("TO_DATE".equalsIgnoreCase(functionName) && params != null && params.size() >= 2) {
-                String dateStr = params.get(0).toString();
-                String oracleFormat = params.get(1).toString().replaceAll("['\"]", "");
-                String mysqlFormat = convertDateFormat(oracleFormat);
-                return "STR_TO_DATE(" + dateStr + ", " + mysqlFormat + ")";
-            }
-
-            // 其他函数
-            StringBuilder funcCall = new StringBuilder(functionName).append("(");
-            if (params != null) {
-                for (int i = 0; i < params.size(); i++) {
-                    if (i > 0) funcCall.append(", ");
-                    funcCall.append(convertExpressionLowerColumn(params.get(i)));
-                }
-            }
-            funcCall.append(")");
-            return funcCall.toString();
-        }
-        if (expression instanceof Column) {
-            Column column = (Column) expression;
-            return cleanIdentifier(column.getColumnName());
-        }
-
-        // 递归处理常见的表达式类型: 比如二元操作符等
-        // 通过反射简化处理（如 left/right/operand/expressions），否则处理toString
-        try {
-            // 处理二元运算，如 AndExpression, EqualsTo 等
-            Method getLeft = expression.getClass().getMethod("getLeftExpression");
-            Method getRight = expression.getClass().getMethod("getRightExpression");
-            Object left = getLeft.invoke(expression);
-            Object right = getRight.invoke(expression);
-            String op = expression.getClass().getSimpleName();
-            String opStr;
-            // 还原运算符 (适用于大部分JSqlParser)
-            if (op.endsWith("AndExpression")) {
-                opStr = " AND ";
-            } else if (op.endsWith("OrExpression")) {
-                opStr = " OR ";
-            } else if (op.endsWith("EqualsTo")) {
-                opStr = " = ";
-            } else if (op.endsWith("NotEqualsTo")) {
-                opStr = " <> ";
-            } else if (op.endsWith("GreaterThan")) {
-                opStr = " > ";
-            } else if (op.endsWith("GreaterThanEquals")) {
-                opStr = " >= ";
-            } else if (op.endsWith("MinorThan")) {
-                opStr = " < ";
-            } else if (op.endsWith("MinorThanEquals")) {
-                opStr = " <= ";
-            } else if (op.endsWith("LikeExpression")) {
-                opStr = " LIKE ";
-            } else if (op.endsWith("InExpression")) {
-                opStr = " IN ";
-            } else if (op.endsWith("IsNullExpression")) {
-                // IS NULL/IS NOT NULL表达式
-                boolean not = false;
-                try {
-                    not = (boolean) expression.getClass().getMethod("isNot").invoke(expression);
-                } catch (Exception ignore) {}
-                return convertExpressionLowerColumn((Expression) left) + (not ? " IS NOT NULL" : " IS NULL");
-            } else {
-                opStr = " " + op.replaceAll("Expression$", "") + " ";
-            }
-            return convertExpressionLowerColumn((Expression) left) + opStr + convertExpressionLowerColumn((Expression) right);
-        } catch (Exception ignore) {}
-
-        // 尝试括号表达式
-        try {
-            Method getExpr = expression.getClass().getMethod("getExpression");
-            Object exprObj = getExpr.invoke(expression);
-            return "(" + convertExpressionLowerColumn((Expression) exprObj) + ")";
-        } catch (Exception ignore) {}
-
-        // 处理IN (xxx, yyy)结构
-        try {
-            Method getLeft = expression.getClass().getMethod("getLeftExpression");
-            Object left = getLeft.invoke(expression);
-            Method getRightItems = expression.getClass().getMethod("getRightItemsList");
-            Object rightItems = getRightItems.invoke(expression);
-            if (rightItems instanceof ExpressionList) {
-                @SuppressWarnings("unchecked")
-                List<Expression> exprs = ((ExpressionList) rightItems).getExpressions();
-                StringBuilder sb = new StringBuilder();
-                sb.append(convertExpressionLowerColumn((Expression) left)).append(" IN (");
-                for (int i = 0; i < exprs.size(); i++) {
-                    if (i != 0) sb.append(", ");
-                    sb.append(convertExpressionLowerColumn(exprs.get(i)));
-                }
-                sb.append(")");
-                return sb.toString();
-            }
-        } catch (Exception ignore) {}
-
-        // 其他表达式 fallback
-        // 尝试替换 identifier/列名为小写，提升兼容性
-        String exprStr = expression.toString();
-        // 用正则尽可能替换列名，仅替换未加引号、未作函数调用的写法, 不影响其他标识符
-        // Java 8 前 Matcher 没有传入 lambda 的方法，因此需要自己用StringBuffer实现替换
-        Pattern colNamePattern = Pattern.compile("([a-zA-Z_][a-zA-Z_0-9]*)");
-        Matcher matcher = colNamePattern.matcher(exprStr);
-        StringBuffer sb = new StringBuffer();
-        while (matcher.find()) {
-            matcher.appendReplacement(sb, matcher.group(1).toLowerCase());
-        }
-        matcher.appendTail(sb);
-        exprStr = sb.toString();
-        return exprStr;
     }
 
     private String convertExpression(Expression expression) {
@@ -636,15 +554,112 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                 params = exprList.getExpressions();
             }
 
-            // 特殊处理TO_DATE函数
-            if ("TO_DATE".equalsIgnoreCase(functionName) && params != null && params.size() >= 2) {
-                String dateStr = params.get(0).toString();
-                String oracleFormat = params.get(1).toString().replaceAll("['\"]", "");
-                String mysqlFormat = convertDateFormat(oracleFormat);
-                return "STR_TO_DATE(" + dateStr + ", " + mysqlFormat + ")";
+            // PostgreSQL函数转MySQL函数
+            switch (functionName.toUpperCase(Locale.ROOT)) {
+                case "CURRENT_TIMESTAMP":
+                case "NOW":
+                case "LOCALTIMESTAMP":
+                    return "NOW()";
+                case "CURRENT_DATE":
+                case "LOCALDATE":
+                    return "CURDATE()";
+                case "CURRENT_TIME":
+                case "LOCALTIME":
+                    return "CURTIME()";
+                case "COALESCE":
+                    if (params != null && !params.isEmpty()) {
+                        StringBuilder sb = new StringBuilder("COALESCE(");
+                        for (int i = 0; i < params.size(); i++) {
+                            if (i > 0) sb.append(", ");
+                            sb.append(convertExpression(params.get(i)));
+                        }
+                        sb.append(")");
+                        return sb.toString();
+                    }
+                    break;
+                case "SUBSTRING":
+                    if (params != null && params.size() >= 2) {
+                        String str = convertExpression(params.get(0));
+                        String start = convertExpression(params.get(1));
+                        if (params.size() >= 3) {
+                            String length = convertExpression(params.get(2));
+                            return "SUBSTRING(" + str + ", " + start + ", " + length + ")";
+                        }
+                        return "SUBSTRING(" + str + ", " + start + ")";
+                    }
+                    break;
+                case "TO_CHAR":
+                    if (params != null && params.size() >= 1) {
+                        String expr = convertExpression(params.get(0));
+                        // 简化处理：转换为字符串
+                        return "CAST(" + expr + " AS CHAR)";
+                    }
+                    break;
+                case "TO_DATE":
+                    if (params != null && params.size() >= 2) {
+                        String dateStr = convertExpression(params.get(0));
+                        String format = params.get(1).toString().replaceAll("['\"]", "");
+                        String mysqlFormat = convertDateFormat(format);
+                        return "STR_TO_DATE(" + dateStr + ", " + mysqlFormat + ")";
+                    }
+                    break;
+                case "TO_TIMESTAMP":
+                    if (params != null && params.size() >= 2) {
+                        String dateStr = convertExpression(params.get(0));
+                        String format = params.get(1).toString().replaceAll("['\"]", "");
+                        String mysqlFormat = convertDateFormat(format);
+                        return "STR_TO_DATE(" + dateStr + ", " + mysqlFormat + ")";
+                    } else if (params != null && !params.isEmpty()) {
+                        // 转换UNIX时间戳
+                        return "FROM_UNIXTIME(" + convertExpression(params.get(0)) + ")";
+                    }
+                    break;
+                case "CONCAT":
+                case "CONCAT_WS":
+                    if (params != null && !params.isEmpty()) {
+                        StringBuilder sb = new StringBuilder("CONCAT(");
+                        for (int i = 0; i < params.size(); i++) {
+                            if (i > 0) sb.append(", ");
+                            sb.append(convertExpression(params.get(i)));
+                        }
+                        sb.append(")");
+                        return sb.toString();
+                    }
+                    break;
+                case "STRING_AGG":
+                    if (params != null && params.size() >= 1) {
+                        String expr = convertExpression(params.get(0));
+                        String delimiter = params.size() >= 2 ? convertExpression(params.get(1)) : "','";
+                        return "GROUP_CONCAT(" + expr + " SEPARATOR " + delimiter + ")";
+                    }
+                    break;
+                case "EXTRACT":
+                    if (params != null && params.size() >= 1) {
+                        String extractField = params.get(0).toString().toUpperCase(Locale.ROOT);
+                        String source = params.size() >= 2 ? convertExpression(params.get(1)) : "";
+                        switch (extractField) {
+                            case "EPOCH":
+                                return "UNIX_TIMESTAMP(" + source + ")";
+                            case "YEAR":
+                                return "YEAR(" + source + ")";
+                            case "MONTH":
+                                return "MONTH(" + source + ")";
+                            case "DAY":
+                                return "DAY(" + source + ")";
+                            case "HOUR":
+                                return "HOUR(" + source + ")";
+                            case "MINUTE":
+                                return "MINUTE(" + source + ")";
+                            case "SECOND":
+                                return "SECOND(" + source + ")";
+                            default:
+                                return "EXTRACT(" + extractField + " FROM " + source + ")";
+                        }
+                    }
+                    break;
             }
 
-            // 其他函数
+            // 其他函数：保持原样但转换参数
             StringBuilder funcCall = new StringBuilder(functionName).append("(");
             if (params != null) {
                 for (int i = 0; i < params.size(); i++) {
@@ -661,20 +676,32 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         }
 
         // 处理其他表达式类型...
-        return expression.toString();
+        String exprStr = expression.toString();
+        // 转换PostgreSQL的布尔字面量
+        exprStr = exprStr.replaceAll("(?i)\\bTRUE\\b", "1");
+        exprStr = exprStr.replaceAll("(?i)\\bFALSE\\b", "0");
+        // 转换PostgreSQL的类型转换语法 ::type
+        exprStr = exprStr.replaceAll("::\\w+", "");
+        return exprStr;
     }
 
-    private String convertDateFormat(String oracleFormat) {
-        String format = oracleFormat.toUpperCase(Locale.ROOT);
+    private String convertDateFormat(String postgresqlFormat) {
+        String format = postgresqlFormat.toUpperCase(Locale.ROOT);
         Map<String, String> formatMap = new HashMap<>();
         formatMap.put("YYYY", "%Y");
         formatMap.put("YY", "%y");
         formatMap.put("MM", "%m");
         formatMap.put("DD", "%d");
         formatMap.put("HH24", "%H");
+        formatMap.put("HH12", "%h");
         formatMap.put("HH", "%h");
         formatMap.put("MI", "%i");
         formatMap.put("SS", "%s");
+        formatMap.put("DAY", "%W");
+        formatMap.put("DY", "%a");
+        formatMap.put("MON", "%b");
+        formatMap.put("MONTH", "%M");
+        formatMap.put("YEAR", "%Y");
 
         for (Map.Entry<String, String> entry : formatMap.entrySet()) {
             format = format.replace(entry.getKey(), entry.getValue());

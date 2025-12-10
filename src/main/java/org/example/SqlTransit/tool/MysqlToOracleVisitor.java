@@ -1,6 +1,6 @@
-package org.example.SqlTransitAI.tool;
+package org.example.SqlTransit.tool;
 
-import net.sf.jsqlparser.schema.Table;
+
 import net.sf.jsqlparser.statement.create.table.ColumnDefinition;
 import net.sf.jsqlparser.statement.create.table.CreateTable;
 import net.sf.jsqlparser.statement.create.index.CreateIndex;
@@ -11,9 +11,7 @@ import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.statement.StatementVisitorAdapter;
 
-import java.lang.reflect.Field;
 import java.util.*;
-import java.util.stream.Collectors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -151,35 +149,6 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         expr = replaceBooleanLiterals(expr);
         expr = uppercaseWhereColumnNames(expr);
         return " WHERE " + expr;
-    }
-
-    // 工具方法：提取注释内容（兼容COMMENT 'xxx'和COMMENT="xxx"等）
-    private String extractCommentFromSpecs(List<String> specs) {
-        if (specs == null) return null;
-        for (int i = 0; i < specs.size(); i++) {
-            String token = specs.get(i);
-            String lct = token.toLowerCase();
-            if (lct.equals("comment") && i + 1 < specs.size()) {
-                String val = specs.get(i+1);
-                // 去除引号
-                if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith("\"") && val.endsWith("\""))) {
-                    val = val.substring(1, val.length()-1);
-                }
-                return val;
-            }
-            // 有些情况下 COMMENT='value' 紧凑在一个token
-            if (lct.startsWith("comment=") || lct.startsWith("comment'") || lct.startsWith("comment\"")) {
-                int eqIdx = token.indexOf('=');
-                if (eqIdx >= 0 && eqIdx+1 < token.length()) {
-                    String val = token.substring(eqIdx+1);
-                    if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith("\"") && val.endsWith("\""))) {
-                        val = val.substring(1, val.length()-1);
-                    }
-                    return val;
-                }
-            }
-        }
-        return null;
     }
 
     // 工具方法：提取表的注释（获取CREATE TABLE末尾的COMMENT='xxx'）
@@ -424,12 +393,12 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 } else if ("PRIMARY".equals(spec)) {
                     // 单独的 PRIMARY 可能表示 PRIMARY KEY
                     isPrimaryKey = true;
-                } else if ("KEY".equals(spec) && j > 0 && "PRIMARY".equals(specs.get(j-1).toUpperCase())) {
+                } else if ("KEY".equals(spec) && j > 0 && "PRIMARY".equalsIgnoreCase(specs.get(j-1))) {
                     // 已经处理过，跳过
                 } else if ("NOT".equals(spec)) {
                     // 单独的 NOT 可能表示 NOT NULL
                     isNotNull = true;
-                } else if ("NULL".equals(spec) && j > 0 && "NOT".equals(specs.get(j-1).toUpperCase())) {
+                } else if ("NULL".equals(spec) && j > 0 && "NOT".equalsIgnoreCase(specs.get(j-1))) {
                     // 已经处理过，跳过
                 } else if ("UNIQUE".equals(spec)) {
                     isUnique = true;
