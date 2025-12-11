@@ -1,6 +1,5 @@
 package org.example.SqlTransit.tool;
 
-
 import net.sf.jsqlparser.statement.create.table.ColumnDefinition;
 import net.sf.jsqlparser.statement.create.table.CreateTable;
 import net.sf.jsqlparser.statement.create.index.CreateIndex;
@@ -17,9 +16,7 @@ import java.util.regex.Pattern;
 
 public class MysqlToGDBVisitor extends StatementVisitorAdapter {
     private final StringBuilder goldenDbSql = new StringBuilder();
-    private final List<String> comments = new ArrayList<>();
     private final Map<String, List<String>> tableShardingInfo = new HashMap<>();
-    private final List<String> partitionStatements = new ArrayList<>();
 
     private static final Set<String> GOLDENDB_KEYWORDS = new HashSet<>(Arrays.asList(
             "SHARD", "SHARDKEY", "SHARDCOUNT", "DATANODE", "GROUP",
@@ -130,13 +127,12 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
         return null;
     }
 
-    private String joinListWithComma(List<?> list) {
-        // Utility replacement for String.join(",", list) which is unavailable for List<?>
-        if (list == null || list.isEmpty()) return "";
+    private String argsToJoinedString(List<?> args) {
+        if (args == null || args.isEmpty()) return "";
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < list.size(); i++) {
+        for (int i = 0; i < args.size(); i++) {
             if (i > 0) sb.append(",");
-            sb.append(list.get(i));
+            sb.append(String.valueOf(args.get(i)));
         }
         return sb.toString();
     }
@@ -226,35 +222,20 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
                 return "TINYINT(1)";
             case "ENUM":
                 if (args != null && !args.isEmpty()) {
-                    return "ENUM(" + joinListWithComma(args) + ")";
+                    // String.join is not available for List<?>, so use helper function
+                    return "ENUM(" + argsToJoinedString(args) + ")";
                 }
                 return "ENUM('Y','N')";
             case "SET":
                 if (args != null && !args.isEmpty()) {
-                    return "SET(" + joinListWithComma(args) + ")";
+                    return "SET(" + argsToJoinedString(args) + ")";
                 }
                 return "SET('')";
             case "JSON":
                 return "JSON";
-            case "GEOMETRY":
-                return "GEOMETRY";
-            case "POINT":
-                return "POINT";
-            case "LINESTRING":
-                return "LINESTRING";
-            case "POLYGON":
-                return "POLYGON";
-            case "MULTIPOINT":
-                return "MULTIPOINT";
-            case "MULTILINESTRING":
-                return "MULTILINESTRING";
-            case "MULTIPOLYGON":
-                return "MULTIPOLYGON";
-            case "GEOMETRYCOLLECTION":
-                return "GEOMETRYCOLLECTION";
             default:
                 if (args != null && !args.isEmpty()) {
-                    return type + "(" + joinListWithComma(args) + ")";
+                    return type + "(" + argsToJoinedString(args) + ")";
                 }
                 return type;
         }
@@ -367,14 +348,6 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
                         continue;
                     }
                     if ("FOREIGN KEY".equals(twoWords)) {
-                        String fkConstraint = "CONSTRAINT FK_" + tableName + "_" + colName +
-                                " FOREIGN KEY (" + colName + ")";
-                        if (j + 4 < specs.size()) {
-                            String refTable = specs.get(j + 2).replace("`", "").replace("\"", "");
-                            String refCol = specs.get(j + 4).replace("`", "").replace("\"", "");
-                            fkConstraint += " REFERENCES " + cleanIdentifier(refTable) +
-                                    "(" + cleanIdentifier(refCol) + ")";
-                        }
                         j += 4;
                         continue;
                     }
@@ -387,11 +360,6 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
                         break;
                     case "PRIMARY":
                         isPrimaryKey = true;
-                        break;
-                    case "KEY":
-                        if (j > 0 && "PRIMARY".equalsIgnoreCase(specs.get(j-1))) {
-                        } else {
-                        }
                         break;
                     case "NOT":
                         isNotNull = true;
@@ -429,17 +397,10 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
                             j += 2;
                         }
                         break;
-                    case "CHECK":
-                        if (j + 1 < specs.size()) {
-                            String checkExpr = specs.get(j + 1);
-                            goldenDbSql.append(",\n    CONSTRAINT CHK_" + tableName + "_" + colName +
-                                    " CHECK (" + checkExpr + ")");
-                            j++;
-                        }
-                        break;
                 }
             }
 
+            // 构建字段定义
             goldenDbSql.append("    ").append(colName).append(" ").append(colType);
 
             if (charset != null) {
@@ -479,20 +440,23 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
                 goldenDbSql.append(" PRIMARY KEY");
             }
 
+            if (isUnique) {
+                goldenDbSql.append(" UNIQUE");
+            }
+
+            // 字段注释直接放在字段定义后面
             if (columnComment != null && !columnComment.isEmpty()) {
                 columnComment = columnComment.replaceAll("^['\"]|['\"]$", "");
-                comments.add("COMMENT ON COLUMN " + tableName + "." + colName +
-                        " IS '" + columnComment.replace("'", "''") + "';\n");
+                goldenDbSql.append(" COMMENT '").append(columnComment.replace("'", "''")).append("'");
             }
         }
 
-        List<String> uniqueConstraints = extractUniqueConstraints(createTable);
-        for (String uniqueConstraint : uniqueConstraints) {
-            goldenDbSql.append(",\n    ").append(uniqueConstraint);
-        }
+        // 表级约束处理（外键、检查约束等）
+        processTableLevelConstraints(createTable, tableName);
 
         goldenDbSql.append("\n)");
 
+        // 表级注释
         String tableComment = extractTableComment(createTable);
         if (tableComment != null && !tableComment.isEmpty()) {
             tableComment = tableComment.trim();
@@ -505,12 +469,14 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
             goldenDbSql.append(" COMMENT='").append(tableComment).append("'");
         }
 
+        // 表选项
         goldenDbSql.append(" ENGINE=InnoDB");
         goldenDbSql.append(" DEFAULT CHARSET=utf8mb4");
         goldenDbSql.append(" COLLATE=utf8mb4_general_ci");
 
         goldenDbSql.append(";\n\n");
 
+        // 添加分片键语句
         List<String> shardKeys = tableShardingInfo.get(tableName);
         if (shardKeys != null && !shardKeys.isEmpty()) {
             goldenDbSql.append("ALTER TABLE ").append(tableName).append(" ADD SHARDKEY (");
@@ -520,29 +486,59 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
             }
             goldenDbSql.append(");\n\n");
         }
-
-        if (!comments.isEmpty()) {
-            for (String cmt : comments) {
-                goldenDbSql.append(cmt);
-            }
-            comments.clear();
-        }
     }
 
-    private List<String> extractUniqueConstraints(CreateTable createTable) {
-        List<String> constraints = new ArrayList<>();
+    private void processTableLevelConstraints(CreateTable createTable, String tableName) {
         String createStr = createTable.toString();
 
-        Pattern uniquePattern = Pattern.compile(
-                "(?i)(UNIQUE\\s+(?:KEY\\s+)?(?:`[^`]+`\\s+)?\\([^)]+\\))"
+        // 提取外键约束
+        Pattern fkPattern = Pattern.compile(
+                "(?i)CONSTRAINT\\s+([^\\s]+)\\s+FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s+REFERENCES\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
+                Pattern.CASE_INSENSITIVE
         );
-        Matcher matcher = uniquePattern.matcher(createStr);
+        Matcher fkMatcher = fkPattern.matcher(createStr);
 
-        while (matcher.find()) {
-            constraints.add(matcher.group(1));
+        while (fkMatcher.find()) {
+            String constraintName = cleanIdentifier(fkMatcher.group(1));
+            String columns = fkMatcher.group(2);
+            String refTable = cleanIdentifier(fkMatcher.group(3));
+            String refColumns = fkMatcher.group(4);
+
+            goldenDbSql.append(",\n    CONSTRAINT ").append(constraintName)
+                    .append(" FOREIGN KEY (").append(columns).append(")")
+                    .append(" REFERENCES ").append(refTable)
+                    .append(" (").append(refColumns).append(")");
         }
 
-        return constraints;
+        // 提取检查约束
+        Pattern checkPattern = Pattern.compile(
+                "(?i)CONSTRAINT\\s+([^\\s]+)\\s+CHECK\\s*\\(([^)]+)\\)",
+                Pattern.CASE_INSENSITIVE
+        );
+        Matcher checkMatcher = checkPattern.matcher(createStr);
+
+        while (checkMatcher.find()) {
+            String constraintName = cleanIdentifier(checkMatcher.group(1));
+            String condition = checkMatcher.group(2);
+
+            goldenDbSql.append(",\n    CONSTRAINT ").append(constraintName)
+                    .append(" CHECK (").append(condition).append(")");
+        }
+
+        // 提取唯一约束（表级）
+        Pattern uniquePattern = Pattern.compile(
+                "(?i)CONSTRAINT\\s+([^\\s]+)\\s+UNIQUE\\s*\\(([^)]+)\\)",
+                Pattern.CASE_INSENSITIVE
+        );
+        Matcher uniqueMatcher = uniquePattern.matcher(createStr);
+
+        while (uniqueMatcher.find()) {
+            String constraintName = cleanIdentifier(uniqueMatcher.group(1));
+            String columns = uniqueMatcher.group(2);
+
+            goldenDbSql.append(",\n    CONSTRAINT ").append(constraintName)
+                    .append(" UNIQUE (").append(columns).append(")");
+        }
     }
 
     private List<String> parseConstraintTokens(String input) {
@@ -631,7 +627,7 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
         if (isUnique) goldenDbSql.append(" UNIQUE");
         goldenDbSql.append(" INDEX ").append(indexName)
                 .append(" ON ").append(tableName)
-                .append(" (").append(joinListWithCommaWithSpace(columns)).append(")");
+                .append(" (").append(String.join(", ", columns)).append(")");
 
         String indexStr = createIndex.toString();
         if (indexStr.toUpperCase().contains("USING BTREE")) {
@@ -641,17 +637,6 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
         }
 
         goldenDbSql.append(";\n\n");
-    }
-
-    // Helper method for join in "CREATE INDEX ..." since standard String.join may not support List<?> for some compilers
-    private String joinListWithCommaWithSpace(List<?> list) {
-        if (list == null || list.isEmpty()) return "";
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < list.size(); i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(list.get(i));
-        }
-        return sb.toString();
     }
 
     @Override
