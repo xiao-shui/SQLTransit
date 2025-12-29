@@ -20,16 +20,44 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class OracleToGDBVisitor extends StatementVisitorAdapter {
-    private final StringBuilder gdbSql = new StringBuilder();
-    private final List<String> commentStatements = new ArrayList<>();
+    private enum ChunkType { CREATE_TABLE, RAW }
 
-    // 清理并大写标识符（所有位置都大写，去引号）
-    private String cleanIdentifier(String name) {
-        if (name == null) return null;
-        return name.replaceAll("^[`'\"]+|[`'\"]+$", "").toUpperCase();
+    private static class Chunk {
+        final ChunkType type;
+        final CreateTable createTable;
+        final String rawSql;
+        Chunk(CreateTable createTable) {
+            this.type = ChunkType.CREATE_TABLE;
+            this.createTable = createTable;
+            this.rawSql = null;
+        }
+        Chunk(String rawSql) {
+            this.type = ChunkType.RAW;
+            this.createTable = null;
+            this.rawSql = rawSql;
+        }
     }
 
-    // 表名处理（去引号且大写，带schema也大写，形如 SCHEMA.TABLE）
+    private final List<Chunk> chunks = new ArrayList<>();
+    private final Map<String, String> columnComments = new HashMap<>(); // 存储列注释：table.column -> comment
+    private final Map<String, String> tableComments = new HashMap<>(); // 存储表注释：table -> comment
+    private final Map<String, Set<String>> tablePkColsMap = new HashMap<>(); // 表主键列集合，去模式名，用于去重索引
+    private String currentTableName = null; // 当前处理的表名
+
+    private void addRawSql(String sql) {
+        if (sql != null && !sql.isEmpty()) {
+            chunks.add(new Chunk(sql));
+        }
+    }
+
+    // 清理标识符并添加反引号（小写）
+    private String cleanIdentifier(String name) {
+        if (name == null) return null;
+        String cleaned = name.replaceAll("^[`'\"]+|[`'\"]+$", "").toLowerCase();
+        return "`" + cleaned + "`";
+    }
+
+    // 获取表的完整名称（小写，带schema）
     private String getFullTableName(Table table) {
         if (table == null) return "";
         String schema = table.getSchemaName();
@@ -41,11 +69,26 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
         }
     }
 
-    // Helper for strings like "NX_BUP"."APP_INFO_CONF" → NX_BUP.APP_INFO_CONF
-    private String getFullTableNameStr(String raw) {
+    // 处理表名字符串，去掉schema部分，返回小写表名
+    private String getTableNameOnly(String raw) {
         if (raw == null) return null;
-        String s = raw.replaceAll("^[`'\"]+|[`'\"]+$", "");
-        return s.replaceAll("\"", "").toUpperCase().replaceAll("\\s+", "");
+        // 去掉引号
+        String s = raw.replaceAll("[`'\"]", "");
+        // 按点分割，取最后一部分作为表名
+        String[] parts = s.split("\\.");
+        String tableName = parts.length > 0 ? parts[parts.length - 1] : s;
+        return tableName.toLowerCase();
+    }
+
+    // 去掉schema并清洗名称，返回带反引号的小写索引名
+    private String cleanIdentifierNoSchema(String name) {
+        if (name == null) return null;
+        String cleaned = name.replaceAll("[`'\"]", "");
+        if (cleaned.contains(".")) {
+            cleaned = cleaned.substring(cleaned.lastIndexOf(".") + 1);
+        }
+        cleaned = cleaned.trim().toLowerCase();
+        return "`" + cleaned + "`";
     }
 
     // 替换布尔字面量 'Y'/'N' → true/false（忽略字符串内）
@@ -82,7 +125,6 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
     }
 
     private String uppercaseWhereColumnNames(String sql) {
-        // 可扩展, 当前直接返回原文
         return sql;
     }
 
@@ -146,8 +188,36 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
     private String convertColumnType(String oracleType, List<?> args) {
         String type = oracleType.toUpperCase();
         switch (type) {
-            case "NUMBER":
+            case "NUMBER": {
+                Integer p = null;
+                Integer s = null;
+                try {
+                    if (args != null && args.size() >= 1 && args.get(0) != null) {
+                        p = Integer.parseInt(args.get(0).toString());
+                    }
+                    if (args != null && args.size() >= 2 && args.get(1) != null) {
+                        s = Integer.parseInt(args.get(1).toString());
+                    }
+                } catch (NumberFormatException ignored) {}
+
+                // 精确规则
+                if (p != null && (p == 1) && (s == null || s == 0)) {
+                    return "TINYINT(1)";
+                }
+                if (p != null && s != null && s > 0) {
+                    return "DECIMAL(" + p + "," + s + ")";
+                }
+                if (p != null && p == 10 && (s == null || s == 0)) {
+                    return "DOUBLE";
+                }
+                if (p != null && p <= 9 && (s == null || s == 0)) {
+                    return "INT(" + p + ")";
+                }
+                if (p != null && p > 10 && (s == null || s == 0)) {
                 return "BIGINT";
+                }
+                return "DOUBLE";
+            }
             case "VARCHAR2":
             case "VARCHAR":
                 if (args != null && !args.isEmpty()) {
@@ -155,10 +225,14 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                 }
                 return "VARCHAR";
             case "DATE":
-            case "TIMESTAMP":
                 return "DATETIME";
-            case "CLOB":
-                return "TEXT";
+            case "TIMESTAMP":
+                if (args != null && !args.isEmpty()) {
+                    return "DATETIME(" + args.get(0) + ")";
+                }
+                return "DATETIME";
+            case "NCLOB":
+                return "LONGTEXT";
             default:
                 if (args != null && !args.isEmpty()) {
                     return type + "(" + args.get(0) + ")";
@@ -214,23 +288,12 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
 
     @Override
     public void visit(CreateTable createTable) {
-        // 输出表名/模式名均为大写, 不加引号
-        String tableName;
+        // 延迟渲染，先缓存 AST，最终在 getGdbSql 时统一输出，以便后置 COMMENT 也能内联
+        // 同时预先记录主键列集合，供后续索引去重判断使用
         try {
             Table table = createTable.getTable();
-            if (table != null && table.getSchemaName() != null && !table.getSchemaName().isEmpty()) {
-                tableName = cleanIdentifier(table.getSchemaName()) + "." + cleanIdentifier(table.getName());
-            } else {
-                tableName = cleanIdentifier(createTable.getTable().getName());
-            }
-        } catch (Exception e) {
-            tableName = cleanIdentifier(createTable.getTable().getName());
-        }
-        gdbSql.append("CREATE TABLE ").append(tableName).append(" (\n");
-
-        List<ColumnDefinition> columns = createTable.getColumnDefinitions();
+            String tableName = cleanIdentifier(table.getName());
         Set<String> tablePrimaryKeyCols = new LinkedHashSet<>();
-        List<String> checkConstraints = new ArrayList<>();
         try {
             java.lang.reflect.Method getIndexesMethod = CreateTable.class.getMethod("getIndexes");
             List<?> indexes = (List<?>) getIndexesMethod.invoke(createTable);
@@ -239,83 +302,158 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                     String idxStr = idx.toString().trim();
                     String idxStrUpper = idxStr.toUpperCase();
                     if (idxStrUpper.contains("PRIMARY KEY")) {
-                        List<String> pkCols = null;
-                        try {
-                            java.lang.reflect.Method getColumnsNamesMethod = idx.getClass().getMethod("getColumnsNames");
-                            Object pkColsObj = getColumnsNamesMethod.invoke(idx);
-                            if (pkColsObj instanceof List) {
-                                pkCols = (List<String>) pkColsObj;
-                            }
-                        } catch (Exception ignore) {}
-                        if (pkCols == null) {
-                            Pattern pkPattern = Pattern.compile(
-                                    "PRIMARY KEY\\s*\\(([^)]+)\\)", Pattern.CASE_INSENSITIVE);
-                            Matcher m = pkPattern.matcher(idxStrUpper);
-                            if (m.find()) {
-                                String cols = m.group(1);
-                                String[] arr = cols.split(",");
-                                pkCols = new ArrayList<>();
-                                for (String c : arr) pkCols.add(c.replaceAll("[`'\"]", "").trim().toUpperCase());
-                            }
-                        }
-                        if (pkCols != null) tablePrimaryKeyCols.addAll(pkCols);
-                    } else if (idxStrUpper.contains("CHECK")) {
-                        try {
-                            java.lang.reflect.Method getExpressionMethod = idx.getClass().getMethod("getExpression");
-                            Object expressionObj = getExpressionMethod.invoke(idx);
-                            String checkExpr = null;
-                            if (expressionObj != null) {
-                                checkExpr = expressionObj.toString();
-                            }
-                            String checkName = "";
-                            try {
-                                java.lang.reflect.Method getNamePartsMethod = idx.getClass().getMethod("getNameParts");
-                                Object namePartsObj = getNamePartsMethod.invoke(idx);
-                                if (namePartsObj instanceof List) {
-                                    List<?> nameParts = (List<?>) namePartsObj;
-                                    if (!nameParts.isEmpty()) {
-                                        checkName = nameParts.get(0).toString();
-                                    }
-                                }
-                            } catch (Exception ignore) {
-                                Pattern p = Pattern.compile("CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)", Pattern.CASE_INSENSITIVE);
-                                Matcher m = p.matcher(idxStr);
-                                if (m.find()) {
-                                    checkName = m.group(1);
-                                }
-                            }
-                            String constraintNameClause = "";
-                            if (checkName != null && !checkName.trim().isEmpty()) {
-                                constraintNameClause = "CONSTRAINT " + cleanIdentifier(checkName) + " ";
-                            }
-                            if (checkExpr != null && !checkExpr.trim().isEmpty()) {
-                                checkConstraints.add(constraintNameClause + "CHECK " + checkExpr);
-                            }
-                        } catch (Exception ignore) {
-                            Pattern p = Pattern.compile("CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*CHECK\\s*\\((.+)\\)", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-                            Matcher m = p.matcher(idxStr);
-                            if (m.find()) {
-                                String checkName = m.group(1) != null ? m.group(1) : "";
-                                String checkExpr = m.group(2).trim();
-                                String constraintNameClause = "";
-                                if (!checkName.isEmpty()) {
-                                    constraintNameClause = "CONSTRAINT " + cleanIdentifier(checkName) + " ";
-                                }
-                                checkConstraints.add(constraintNameClause + "CHECK (" + checkExpr + ")");
+                            List<String> pkCols = extractColumnNamesFromConstraint(idxStr);
+                            if (pkCols != null && !pkCols.isEmpty()) {
+                                tablePrimaryKeyCols.addAll(pkCols);
                             }
                         }
                     }
                 }
+            } catch (Exception ignore) { }
+            if (!tablePrimaryKeyCols.isEmpty()) {
+                Set<String> pkSet = new LinkedHashSet<>();
+                for (String c : tablePrimaryKeyCols) {
+                    pkSet.add(c.replace("`", ""));
+                }
+                String normTableKey = tableName.replace("`", "");
+                tablePkColsMap.put(normTableKey, pkSet);
+                            }
+        } catch (Exception ignore) { }
+
+        chunks.add(new Chunk(createTable));
+    }
+
+    @Override
+    public void visit(Comment comment) {
+        String commentStr = comment.toString();
+
+        // 处理表注释
+        Pattern tablePattern = Pattern.compile(
+                "^\\s*COMMENT\\s+ON\\s+TABLE\\s+([^\\s]+)\\s+IS\\s+(['\"])(.*?)\\2",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Matcher tableMatcher = tablePattern.matcher(commentStr);
+        if (tableMatcher.find()) {
+            String table = tableMatcher.group(1);
+            String commentTxt = tableMatcher.group(3);
+
+            // 获取表名（去掉schema）
+            String tableName = getTableNameOnly(table);
+
+            // 存储到Map中，等待CREATE TABLE时使用
+            tableComments.put(tableName, commentTxt);
+
+            return;
+        }
+
+        // 处理列注释
+        Pattern colPattern = Pattern.compile(
+                "^\\s*COMMENT\\s+ON\\s+COLUMN\\s+([^\\s]+)\\s+IS\\s+(['\"])(.*?)\\2",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Matcher colMatcher = colPattern.matcher(commentStr);
+        if (colMatcher.find()) {
+            String column = colMatcher.group(1);
+            String commentTxt = colMatcher.group(3);
+
+            // 解析表名和列名
+            String[] parts = column.split("\\.");
+            if (parts.length >= 2) {
+                String tableName, columnName;
+                if (parts.length == 2) {
+                    // table.column 格式
+                    tableName = parts[0];
+                    columnName = parts[1];
+            } else {
+                    // schema.table.column 格式
+                    tableName = parts[1];
+                    columnName = parts[2];
+                }
+
+                // 清理名称
+                tableName = getTableNameOnly(tableName);
+                columnName = columnName.replaceAll("[`'\"]", "").toLowerCase();
+
+                // 存储到Map中，等待CREATE TABLE时使用
+                String commentKey = tableName + "." + columnName;
+                columnComments.put(commentKey, commentTxt);
+
             }
-        } catch(Exception ignore) { }
+            return;
+        }
 
-        for (int i = 0; i < columns.size(); i++) {
-            ColumnDefinition col = columns.get(i);
-            if (i > 0) gdbSql.append(",\n");
-            String colName = cleanIdentifier(col.getColumnName());
-            String colType = convertColumnType(col.getColDataType().getDataType(),
-                    col.getColDataType().getArgumentsStringList());
+        // 其他注释格式，直接输出
+        addRawSql(commentStr + ";\n");
+    }
 
+    // 列名参数全部小写且带反引号（形如`id`, `code`...）
+    private String parseAndJoinCols(String cols) {
+        if (cols == null) return "";
+                                String[] arr = cols.split(",");
+        List<String> result = new ArrayList<>();
+        for (String c : arr) {
+            result.add(cleanIdentifier(c.trim()));
+        }
+        return String.join(", ", result);
+    }
+
+    @Override
+    public void visit(CreateIndex createIndex) {
+        String indexName;
+        try {
+            indexName = cleanIdentifierNoSchema(createIndex.getIndex().getName());
+        } catch (Exception e) {
+            indexName = cleanIdentifierNoSchema(createIndex.getIndex().getName());
+                                }
+
+        String tableName;
+        try {
+            Table table = createIndex.getTable();
+            if (table != null && table.getSchemaName() != null && !table.getSchemaName().isEmpty()) {
+                tableName = cleanIdentifier(table.getSchemaName()) + "." + cleanIdentifier(table.getName());
+            } else {
+                tableName = cleanIdentifier(createIndex.getTable().getName());
+                            }
+        } catch (Exception e) {
+            tableName = cleanIdentifier(createIndex.getTable().getName());
+        }
+
+        boolean isUnique = false;
+        try {
+            java.lang.reflect.Method isUniqueMethod = createIndex.getClass().getMethod("isUnique");
+            Object result = isUniqueMethod.invoke(createIndex);
+            if (result instanceof Boolean) isUnique = (Boolean) result;
+        } catch (Exception e) {
+            String text = createIndex.toString().toUpperCase();
+            if (text.contains("UNIQUE") || (indexName != null && indexName.toUpperCase().contains("UNIQUE"))) {
+                isUnique = true;
+            }
+        }
+
+        List<String> columns = extractIndexColumns(createIndex);
+
+        // 如果是唯一索引且列集合与表主键一致，跳过创建（避免重复）
+        String normTableKey = tableName.replace("`", "");
+        Set<String> pkCols = tablePkColsMap.get(normTableKey);
+        if (isUnique && pkCols != null && !pkCols.isEmpty()) {
+            Set<String> idxCols = new LinkedHashSet<>();
+            for (String c : columns) {
+                idxCols.add(c.replace("`", ""));
+            }
+            if (pkCols.equals(idxCols)) {
+                return;
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("CREATE");
+        if (isUnique) sb.append(" UNIQUE");
+        sb.append(" INDEX ").append(indexName)
+                .append(" ON ").append(tableName)
+                .append(" (").append(String.join(", ", columns)).append(");\n\n");
+        addRawSql(sb.toString());
+    }
+
+    // 辅助方法：获取列规范
+    private List<String> getColumnSpecs(ColumnDefinition col) {
             List<String> specs = new ArrayList<>();
             try {
                 java.lang.reflect.Method method = ColumnDefinition.class.getMethod("getColumnSpecStrings");
@@ -344,6 +482,246 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                     specs = parseConstraintTokens(constraintsOnly);
                 }
             }
+        return specs;
+    }
+
+    // 辅助方法：提取约束中的列名
+    private List<String> extractColumnNamesFromConstraint(String constraintStr) {
+        List<String> columns = new ArrayList<>();
+        Pattern pattern = Pattern.compile("\\(([^)]+)\\)");
+        Matcher matcher = pattern.matcher(constraintStr);
+        if (matcher.find()) {
+            String cols = matcher.group(1);
+            String[] colArray = cols.split(",");
+            for (String col : colArray) {
+                String cleanCol = col.replaceAll("[`'\"]", "").trim().toLowerCase();
+                if (!cleanCol.isEmpty()) {
+                    columns.add(cleanCol);
+                }
+            }
+        }
+        return columns;
+                    }
+
+    // 辅助方法：提取CHECK约束
+    private String extractCheckConstraint(String constraintStr) {
+        // 匹配两种格式：
+        // 1. CONSTRAINT name CHECK (...)
+        // 2. CHECK (...) （没有约束名）
+        Pattern pattern = Pattern.compile(
+                "(?:CONSTRAINT\\s+([`'\"]?[\\w_]+[`'\"]?)\\s+)?CHECK\\s*\\((.+?)\\)",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Matcher matcher = pattern.matcher(constraintStr);
+        if (matcher.find()) {
+            String checkName = matcher.group(1);
+            String checkExpr = matcher.group(2).trim();
+
+            // 检查是否是 IS NOT NULL（应该已经被处理）
+            if (checkExpr.toUpperCase().contains("IS NOT NULL")) {
+                return null;
+            }
+
+            // 只有约束名存在且不为空且不是 "null" 时才添加约束名
+            String constraintNameClause = "";
+            if (checkName != null && !checkName.trim().isEmpty() && 
+                !checkName.trim().equalsIgnoreCase("null") && 
+                !checkName.replaceAll("[`'\"]", "").trim().equalsIgnoreCase("null")) {
+                constraintNameClause = "CONSTRAINT " + cleanIdentifier(checkName) + " ";
+            }
+            return constraintNameClause + "CHECK (" + checkExpr + ")";
+        }
+        return null;
+    }
+
+    // 辅助方法：添加表级约束
+    private void addTableConstraints(CreateTable createTable, String tableName,
+                                     Set<String> tablePrimaryKeyCols, List<String> checkConstraints,
+                                     StringBuilder sb) {
+        try {
+            java.lang.reflect.Method getIndexesMethod = CreateTable.class.getMethod("getIndexes");
+            List<?> indexes = (List<?>) getIndexesMethod.invoke(createTable);
+            if (indexes != null && !indexes.isEmpty()) {
+                for (Object idx : indexes) {
+                    String idxStr = idx.toString().trim();
+                    String idxStrUpper = idxStr.toUpperCase();
+
+                    if (idxStrUpper.contains("FOREIGN KEY")) {
+                        addForeignKeyConstraint(idxStr, tableName, sb);
+                    } else if (idxStrUpper.contains("PRIMARY KEY")) {
+                        addPrimaryKeyConstraint(idxStr, tableName, tablePrimaryKeyCols, sb);
+                    } else if (idxStrUpper.contains("UNIQUE")) {
+                        addUniqueConstraint(idxStr, tableName, sb);
+                    }
+                }
+            }
+        } catch (Exception e) {}
+
+        // 添加CHECK约束
+        if (!checkConstraints.isEmpty()) {
+            for (String c : checkConstraints) {
+                sb.append(",\n    ").append(c);
+            }
+        }
+    }
+
+    // 辅助方法：添加外键约束
+    private void addForeignKeyConstraint(String constraintStr, String tableName, StringBuilder sb) {
+        // 改进正则表达式以更好地匹配Oracle格式的外键约束（包括schema.table格式和可能的换行）
+        // 匹配格式：CONSTRAINT "name" FOREIGN KEY ("cols") REFERENCES "schema"."table" ("cols")
+        // 使用更灵活的正则，先匹配到REFERENCES后面的表名（可能包含schema.table格式）
+        Pattern pattern = Pattern.compile(
+            "CONSTRAINT\\s+([`'\"][^`'\"]+[`'\"]|[\\w_]+)?\\s*FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Matcher matcher = pattern.matcher(constraintStr);
+        if (matcher.find()) {
+            String fkName = matcher.group(1);
+            String localCols = matcher.group(2);
+            String refTable = matcher.group(3);
+            String refCols = matcher.group(4);
+
+            sb.append(",\n    CONSTRAINT ");
+            if (fkName != null && !fkName.trim().isEmpty()) {
+                sb.append(cleanIdentifier(fkName.trim())).append(" ");
+                            }
+            sb.append("FOREIGN KEY (")
+                                    .append(parseAndJoinCols(localCols))
+                                    .append(") REFERENCES ")
+                    .append(cleanIdentifier(getTableNameOnly(refTable)))
+                                    .append(" (")
+                                    .append(parseAndJoinCols(refCols))
+                                    .append(")");
+                        }
+    }
+
+    // 辅助方法：添加主键约束
+    private void addPrimaryKeyConstraint(String constraintStr, String tableName, Set<String> tablePrimaryKeyCols, StringBuilder sb) {
+        Pattern pattern = Pattern.compile(
+                                "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
+                                Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(constraintStr);
+        if (matcher.find()) {
+            String pkName = matcher.group(1);
+            String cols = matcher.group(2);
+
+                            String[] pkColsArr = cols.split(",");
+                            boolean shouldPrintPK = true;
+                            if (pkColsArr.length == 1) {
+                String singleCol = cleanIdentifier(pkColsArr[0]).replace("`", "");
+                if (tablePrimaryKeyCols.contains(singleCol)) {
+                                    shouldPrintPK = false;
+                                }
+                            }
+                            if (shouldPrintPK) {
+                sb.append(",\n    CONSTRAINT ");
+                                if (pkName != null && !pkName.isEmpty()) {
+                    sb.append(cleanIdentifier(pkName)).append(" ");
+                                }
+                sb.append("PRIMARY KEY (")
+                                        .append(parseAndJoinCols(cols))
+                                        .append(")");
+                            }
+                        }
+    }
+
+    // 辅助方法：添加唯一约束
+    private void addUniqueConstraint(String constraintStr, String tableName, StringBuilder sb) {
+        Pattern pattern = Pattern.compile(
+                                "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*UNIQUE\\s*\\(([^)]+)\\)",
+                                Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(constraintStr);
+        if (matcher.find()) {
+            String uqName = matcher.group(1);
+            String cols = matcher.group(2);
+            sb.append(",\n    CONSTRAINT ");
+                            if (uqName != null && !uqName.isEmpty()) {
+                sb.append(cleanIdentifier(uqName)).append(" ");
+                            }
+            sb.append("UNIQUE (").append(parseAndJoinCols(cols)).append(")");
+                        }
+                    }
+
+    // 渲染 CREATE TABLE（延迟执行，确保 COMMENT 顺序无关）
+    private String renderCreateTable(CreateTable createTable) {
+        StringBuilder sb = new StringBuilder();
+
+        Table table = createTable.getTable();
+        String tableName = cleanIdentifier(table.getName());
+        currentTableName = tableName;
+        sb.append("CREATE TABLE ").append(tableName).append(" (\n");
+
+        List<ColumnDefinition> columns = createTable.getColumnDefinitions();
+        Set<String> tablePrimaryKeyCols = new LinkedHashSet<>();
+        Map<String, Boolean> columnNotNullMap = new HashMap<>();
+        List<String> checkConstraints = new ArrayList<>();
+
+        try {
+            java.lang.reflect.Method getIndexesMethod = CreateTable.class.getMethod("getIndexes");
+            List<?> indexes = (List<?>) getIndexesMethod.invoke(createTable);
+            if (indexes != null) {
+                for (Object idx : indexes) {
+                    String idxStr = idx.toString().trim();
+                    String idxStrUpper = idxStr.toUpperCase();
+                    if (idxStrUpper.contains("PRIMARY KEY")) {
+                        List<String> pkCols = extractColumnNamesFromConstraint(idxStr);
+                        if (pkCols != null && !pkCols.isEmpty()) {
+                            tablePrimaryKeyCols.addAll(pkCols);
+                        }
+                    } else if (idxStrUpper.contains("CHECK")) {
+                        // 处理 CHECK (column IS NOT NULL) 格式
+                        Pattern isNotNullPattern = Pattern.compile(
+                                "CHECK\\s*\\(\\s*\"?([^\"]+)\"?\\s+IS\\s+NOT\\s+NULL\\s*\\)", Pattern.CASE_INSENSITIVE);
+                        Matcher isNotNullMatcher = isNotNullPattern.matcher(idxStr);
+                        if (isNotNullMatcher.find()) {
+                            String colName = isNotNullMatcher.group(1).replaceAll("[`'\"]", "").trim().toLowerCase();
+                            columnNotNullMap.put(colName, true);
+                        } else {
+                            // 处理 CHECK (column IN (1,0)) ENABLE 格式
+                            // 如果带 ENABLE，则：1) 标记字段为 NOT NULL，2) 同时保留 CHECK 约束
+                            Pattern inPattern = Pattern.compile(
+                                    "CHECK\\s*\\(\\s*([`'\"][^`'\"]+[`'\"]|[\\w_]+)\\s+IN\\s*\\(([^)]+)\\)\\s*\\)\\s+ENABLE", 
+                                    Pattern.CASE_INSENSITIVE);
+                            Matcher inMatcher = inPattern.matcher(idxStr);
+                            if (inMatcher.find()) {
+                                String colName = inMatcher.group(1).replaceAll("[`'\"]", "").trim().toLowerCase();
+                                String inValues = inMatcher.group(2).trim();
+                                // 标记字段为 NOT NULL
+                                columnNotNullMap.put(colName, true);
+                                // 格式化 IN 值（在逗号后添加空格，如 "1,0" -> "1, 0"）
+                                String formattedInValues = inValues.replaceAll(",\\s*", ", ");
+                                // 添加 CHECK 约束（带反引号的列名）
+                                String cleanColName = "`" + colName + "`";
+                                checkConstraints.add("CONSTRAINT CHECK (" + cleanColName + " IN (" + formattedInValues + "))");
+                            } else {
+                                // 其他 CHECK 约束，提取但不包括约束名中的 null
+                                String checkConstraint = extractCheckConstraint(idxStr);
+                                if (checkConstraint != null && !checkConstraint.contains("`null`")) {
+                                    checkConstraints.add(checkConstraint);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignore) { }
+
+        if (!tablePrimaryKeyCols.isEmpty()) {
+            Set<String> pkSet = new LinkedHashSet<>();
+            for (String c : tablePrimaryKeyCols) {
+                pkSet.add(c.replace("`", ""));
+                }
+            String normTableKey = tableName.replace("`", "");
+            tablePkColsMap.put(normTableKey, pkSet);
+            }
+
+        for (int i = 0; i < columns.size(); i++) {
+            ColumnDefinition col = columns.get(i);
+            if (i > 0) sb.append(",\n");
+
+            String colName = cleanIdentifier(col.getColumnName());
+            String colType = convertColumnType(col.getColDataType().getDataType(),
+                    col.getColDataType().getArgumentsStringList());
+
+            List<String> specs = getColumnSpecs(col);
 
             boolean isPrimaryKey = false;
             boolean isNotNull = false;
@@ -363,7 +741,7 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                         isNotNull = true;
                         j++;
                         continue;
-                    }
+        }
                 }
                 if ("PRIMARY".equals(spec)) {
                     isPrimaryKey = true;
@@ -377,282 +755,92 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                 }
             }
 
-            // 如果表级主键包含该列，也视为主键（避免JSqlParser不还原inline PRIMARY KEY的bug）
-            if (!isPrimaryKey && tablePrimaryKeyCols.contains(cleanIdentifier(col.getColumnName()))) {
+            String colNameLower = col.getColumnName().replaceAll("[`'\"]", "").toLowerCase();
+            if (!isPrimaryKey && tablePrimaryKeyCols.contains(colNameLower)) {
                 isPrimaryKey = true;
             }
 
-            gdbSql.append("    ").append(colName).append(" ").append(colType);
+            if (columnNotNullMap.containsKey(colNameLower)) {
+                isNotNull = true;
+            }
 
-            String constraintPart = col.toString().toUpperCase().trim();
-            if (constraintPart.contains("NOT NULL")) {
-                gdbSql.append(" NOT NULL");
+            // 主键列统一使用 bigint 类型
+            if (isPrimaryKey) {
+                colType = "BIGINT";
+            }
+
+            sb.append("    ").append(colName).append(" ").append(colType);
+
+            if (isNotNull) {
+                sb.append(" NOT NULL");
             }
 
             if (defaultValStr != null) {
                 defaultValStr = defaultValStr.trim();
                 if (defaultValStr.contains("SYSDATE") || defaultValStr.contains("CURRENT_TIMESTAMP")) {
-                    gdbSql.append(" DEFAULT NOW()");
+                    sb.append(" DEFAULT NOW()");
+                } else if (defaultValStr.equalsIgnoreCase("NULL")) {
+                    sb.append(" DEFAULT NULL");
                 } else if (colType.equalsIgnoreCase("VARCHAR(1)") &&
                         ("'Y'".equalsIgnoreCase(defaultValStr) || "'N'".equalsIgnoreCase(defaultValStr))) {
-                    gdbSql.append(" DEFAULT ").append("'Y'".equalsIgnoreCase(defaultValStr) ? "true" : "false");
-                } else {
-                    gdbSql.append(" DEFAULT ").append(defaultValStr);
+                    sb.append(" DEFAULT ").append("'Y'".equalsIgnoreCase(defaultValStr) ? "true" : "false");
+            } else {
+                    sb.append(" DEFAULT ").append(defaultValStr);
                 }
             }
 
             if (isPrimaryKey) {
-                gdbSql.append(" PRIMARY KEY");
-            } else {
-                if (isUnique) gdbSql.append(" UNIQUE");
+                sb.append(" PRIMARY KEY");
+            } else if (isUnique) {
+                sb.append(" UNIQUE");
             }
 
+            String columnCommentKey = tableName.replace("`", "") + "." + colName.replace("`", "");
+            String columnComment = columnComments.get(columnCommentKey);
 
-            try {
-                java.lang.reflect.Method getCommentMethod = ColumnDefinition.class.getMethod("getComment");
-                Object commentObj = getCommentMethod.invoke(col);
-                if (commentObj != null) {
-                    String columnComment = commentObj.toString().trim();
-                    if (!columnComment.isEmpty()) {
-                        if ((columnComment.startsWith("'") && columnComment.endsWith("'")) ||
-                                (columnComment.startsWith("\"") && columnComment.endsWith("\""))) {
-                            columnComment = columnComment.substring(1, columnComment.length() - 1);
-                        }
-                        String escapedComment = columnComment.replace("'", "''");
-                        commentStatements.add("COMMENT ON COLUMN " + tableName + "." + colName +
-                                " IS '" + escapedComment + "';\n");
-                    }
+            if (columnComment != null && !columnComment.isEmpty()) {
+                if ((columnComment.startsWith("'") && columnComment.endsWith("'")) ||
+                        (columnComment.startsWith("\"") && columnComment.endsWith("\""))) {
+                    columnComment = columnComment.substring(1, columnComment.length() - 1);
                 }
-            } catch (Exception e) {
-                // 忽略
+                String escapedComment = columnComment.replace("'", "''");
+                sb.append(" COMMENT '").append(escapedComment).append("'");
             }
         }
 
-        // 处理表级外键、主键、唯一、CHECK约束
-        try {
-            java.lang.reflect.Method getIndexesMethod = CreateTable.class.getMethod("getIndexes");
-            List<?> indexes = (List<?>) getIndexesMethod.invoke(createTable);
-            if (indexes != null && !indexes.isEmpty()) {
-                for (Object idx : indexes) {
-                    String idxStr = idx.toString().trim();
-                    String idxStrUpper = idxStr.toUpperCase();
-                    if (idxStrUpper.contains("FOREIGN KEY")) {
-                        Pattern fkPattern = Pattern.compile(
-                                "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*FOREIGN KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([`'\"]?[\\w\\.]+[`'\"]?)\\s*\\(([^)]+)\\)",
-                                Pattern.CASE_INSENSITIVE);
-                        Matcher m = fkPattern.matcher(idxStr);
-                        if (m.find()) {
-                            String fkName = m.group(1) == null ? "" : m.group(1);
-                            String localCols = m.group(2);
-                            String refTable = m.group(3);
-                            String refCols = m.group(4);
+        addTableConstraints(createTable, tableName, tablePrimaryKeyCols, checkConstraints, sb);
 
-                            gdbSql.append(",\n    ");
-                            gdbSql.append("CONSTRAINT ");
-                            if (fkName != null && !fkName.isEmpty()) {
-                                gdbSql.append(cleanIdentifier(fkName)).append(" ");
-                            }
-                            gdbSql.append("FOREIGN KEY (")
-                                    .append(parseAndJoinCols(localCols))
-                                    .append(") REFERENCES ")
-                                    .append(getFullTableNameStr(refTable))
-                                    .append(" (")
-                                    .append(parseAndJoinCols(refCols))
-                                    .append(")");
-                        }
-                    } else if (idxStrUpper.contains("PRIMARY KEY")) {
-                        Pattern pkPattern = Pattern.compile(
-                                "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
-                                Pattern.CASE_INSENSITIVE);
-                        Matcher m = pkPattern.matcher(idxStr);
-                        if (m.find()) {
-                            String pkName = m.group(1) == null ? "" : m.group(1);
-                            String cols = m.group(2);
+        sb.append("\n)");
 
-                            String[] pkColsArr = cols.split(",");
-                            boolean shouldPrintPK = true;
-                            if (pkColsArr.length == 1) {
-                                if (tablePrimaryKeyCols.contains(cleanIdentifier(pkColsArr[0]))) {
-                                    shouldPrintPK = false;
-                                }
-                            }
-                            if (shouldPrintPK) {
-                                gdbSql.append(",\n    ");
-                                gdbSql.append("CONSTRAINT ");
-                                if (pkName != null && !pkName.isEmpty()) {
-                                    gdbSql.append(cleanIdentifier(pkName)).append(" ");
-                                }
-                                gdbSql.append("PRIMARY KEY (")
-                                        .append(parseAndJoinCols(cols))
-                                        .append(")");
-                            }
-                        }
-                    } else if (idxStrUpper.contains("UNIQUE")) {
-                        Pattern uqPattern = Pattern.compile(
-                                "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*UNIQUE\\s*\\(([^)]+)\\)",
-                                Pattern.CASE_INSENSITIVE);
-                        Matcher m = uqPattern.matcher(idxStr);
-                        if (m.find()) {
-                            String uqName = m.group(1) == null ? "" : m.group(1);
-                            String cols = m.group(2);
-                            gdbSql.append(",\n    ");
-                            gdbSql.append("CONSTRAINT ");
-                            if (uqName != null && !uqName.isEmpty()) {
-                                gdbSql.append(cleanIdentifier(uqName)).append(" ");
-                            }
-                            gdbSql.append("UNIQUE (").append(parseAndJoinCols(cols)).append(")");
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {}
+        String tableCommentKey = tableName.replace("`", "");
+        String tableComment = tableComments.get(tableCommentKey);
 
-        if (!checkConstraints.isEmpty()) {
-            for (String c : checkConstraints) {
-                gdbSql.append(",\n    ").append(c);
-            }
+        if (tableComment == null) {
+            tableComment = extractTableComment(createTable);
         }
 
-        gdbSql.append("\n);\n\n");
+        if (tableComment != null && !tableComment.isEmpty()) {
+            tableComment = tableComment.trim();
+            if ((tableComment.startsWith("'") && tableComment.endsWith("'")) ||
+                    (tableComment.startsWith("\"") && tableComment.endsWith("\""))) {
+                tableComment = tableComment.substring(1, tableComment.length() - 1);
+            }
+            String escapedComment = tableComment.replace("'", "''");
+            sb.append(" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC COMMENT='")
+                    .append(escapedComment).append("'");
+        } else {
+            sb.append(" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC");
+            }
 
-        try {
-            java.lang.reflect.Method getCommentMethod = CreateTable.class.getMethod("getComment");
-            Object commentObj = getCommentMethod.invoke(createTable);
-            if (commentObj != null && !commentObj.toString().trim().isEmpty()) {
-                String tableComment = commentObj.toString().trim();
-                if ((tableComment.startsWith("'") && tableComment.endsWith("'")) ||
-                        (tableComment.startsWith("\"") && tableComment.endsWith("\""))) {
-                    tableComment = tableComment.substring(1, tableComment.length() - 1);
-                }
-                tableComment = tableComment.replace("'", "''");
-                commentStatements.add("COMMENT ON TABLE " + tableName + " IS '" + tableComment + "';\n");
-            } else {
-                String tableComment2 = extractTableComment(createTable);
-                if (tableComment2 != null && !tableComment2.isEmpty()) {
-                    tableComment2 = tableComment2.trim();
-                    if ((tableComment2.startsWith("'") && tableComment2.endsWith("'")) ||
-                            (tableComment2.startsWith("\"") && tableComment2.endsWith("\""))) {
-                        tableComment2 = tableComment2.substring(1, tableComment2.length() - 1);
-                    }
-                    tableComment2 = tableComment2.replace("'", "''");
-                    commentStatements.add("COMMENT ON TABLE " + tableName + " IS '" + tableComment2 + "';\n");
-                }
-            }
-        } catch (Exception e) {
-            String tableComment2 = extractTableComment(createTable);
-            if (tableComment2 != null && !tableComment2.isEmpty()) {
-                tableComment2 = tableComment2.trim();
-                if ((tableComment2.startsWith("'") && tableComment2.endsWith("'")) ||
-                        (tableComment2.startsWith("\"") && tableComment2.endsWith("\""))) {
-                    tableComment2 = tableComment2.substring(1, tableComment2.length() - 1);
-                }
-                tableComment2 = tableComment2.replace("'", "''");
-                commentStatements.add("COMMENT ON TABLE " + tableName + " IS '" + tableComment2 + "';\n");
-            }
-        }
-
-        if (!commentStatements.isEmpty()) {
-            for (String cmt : commentStatements) {
-                gdbSql.append(cmt);
-            }
-            commentStatements.clear();
-        }
+        sb.append(";\n\n");
+        return sb.toString();
     }
 
-    @Override
-    public void visit(Comment comment) {
-        String commentStr = comment.toString();
-        StringBuilder builder = new StringBuilder("COMMENT ON ");
-        Pattern tablePattern = Pattern.compile(
-                "^\\s*COMMENT\\s+ON\\s+TABLE\\s+(\\S+)\\s+IS\\s+(['\"])(.*?)\\2",
-                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-        Matcher tableMatcher = tablePattern.matcher(commentStr);
-        if (tableMatcher.find()) {
-            String table = tableMatcher.group(1).replaceAll("^[`'\"]+|[`'\"]+$", "");
-            String commentTxt = tableMatcher.group(3);
-            commentTxt = commentTxt.replace("'", "''");
-            builder.append("TABLE ").append(table.toUpperCase()).append(" IS '").append(commentTxt).append("';\n");
-            gdbSql.append(builder);
-            return;
-        }
-        Pattern colPattern = Pattern.compile(
-                "^\\s*COMMENT\\s+ON\\s+COLUMN\\s+(\\S+)\\s+IS\\s+(['\"])(.*?)\\2",
-                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-        Matcher colMatcher = colPattern.matcher(commentStr);
-        if (colMatcher.find()) {
-            String col = colMatcher.group(1).replaceAll("^[`'\"]+|[`'\"]+$", "");
-            String commentTxt = colMatcher.group(3);
-            commentTxt = commentTxt.replace("'", "''");
-            builder.append("COLUMN ").append(col.toUpperCase()).append(" IS '").append(commentTxt).append("';\n");
-            gdbSql.append(builder);
-            return;
-        }
-        builder.append(commentStr).append(";\n");
-        gdbSql.append(builder);
-    }
-
-    // 列名参数全部大写且无引号（形如ID, CODE...）
-    private String parseAndJoinCols(String cols) {
-        if (cols == null) return "";
-        String[] arr = cols.split(",");
-        List<String> result = new ArrayList<>();
-        for (String c : arr) {
-            c = c.trim().replaceAll("^[`'\"]+|[`'\"]+$", "");
-            result.add(c.toUpperCase());
-        }
-        return String.join(", ", result);
-    }
-
-    @Override
-    public void visit(CreateIndex createIndex) {
-        String indexName;
-        try {
-            indexName = cleanIdentifier(createIndex.getIndex().getName());
-        } catch (Exception e) {
-            indexName = cleanIdentifier(createIndex.getIndex().getName());
-        }
-        String tableName;
-        try {
-            Table table = createIndex.getTable();
-            if (table != null && table.getSchemaName() != null && !table.getSchemaName().isEmpty()) {
-                tableName = cleanIdentifier(table.getSchemaName()) + "." + cleanIdentifier(table.getName());
-            } else {
-                tableName = cleanIdentifier(createIndex.getTable().getName());
-            }
-        } catch (Exception e) {
-            tableName = cleanIdentifier(createIndex.getTable().getName());
-        }
-        boolean isUnique = false;
-        try {
-            java.lang.reflect.Method isUniqueMethod = createIndex.getClass().getMethod("isUnique");
-            Object result = isUniqueMethod.invoke(createIndex);
-            if (result instanceof Boolean) isUnique = (Boolean) result;
-        } catch (Exception e) {
-            String text = createIndex.toString().toUpperCase();
-            if (text.contains("UNIQUE") || (indexName != null && indexName.startsWith("UNIQUE_"))) {
-                isUnique = true;
-            }
-        }
-
+    // 辅助方法：提取索引列
+    private List<String> extractIndexColumns(CreateIndex createIndex) {
         List<String> columns = new ArrayList<>();
-        List<?> colsObj = null;
         try {
-            colsObj = (List<?>)CreateIndex.class.getMethod("getColumns").invoke(createIndex);
-        } catch (Exception e) {
-            String idxStr = createIndex.toString();
-            int lpar = idxStr.indexOf('(');
-            int rpar = idxStr.indexOf(')', lpar);
-            if (lpar != -1 && rpar != -1) {
-                String inParens = idxStr.substring(lpar + 1, rpar);
-                String[] colArr = inParens.split(",");
-                for (String raw : colArr) {
-                    String clean = raw.trim().replaceAll("[`'\"]", "");
-                    if (!clean.isEmpty()) {
-                        columns.add(clean.toUpperCase());
-                    }
-                }
-            }
-        }
+            List<?> colsObj = (List<?>)CreateIndex.class.getMethod("getColumns").invoke(createIndex);
         if (colsObj != null) {
             for (Object col : colsObj) {
                 if (col instanceof Column) {
@@ -662,12 +850,19 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                 }
             }
         }
-
-        gdbSql.append("CREATE");
-        if (isUnique) gdbSql.append(" UNIQUE");
-        gdbSql.append(" INDEX ").append(indexName)
-                .append(" ON ").append(tableName)
-                .append(" (").append(String.join(", ", columns)).append(");\n\n");
+        } catch (Exception e) {
+            String idxStr = createIndex.toString();
+            int lpar = idxStr.indexOf('(');
+            int rpar = idxStr.indexOf(')', lpar);
+            if (lpar != -1 && rpar != -1) {
+                String inParens = idxStr.substring(lpar + 1, rpar);
+                String[] colArr = inParens.split(",");
+                for (String raw : colArr) {
+                    columns.add(cleanIdentifier(raw.trim()));
+                }
+            }
+        }
+        return columns;
     }
 
     @Override
@@ -720,6 +915,7 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                     Object idx = expr.getIndex();
                     String idxStr = idx.toString();
                     String idxStrUpper = idxStr.toUpperCase();
+                    StringBuilder sb = new StringBuilder();
                     Pattern pkPattern = Pattern.compile(
                             "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
                             Pattern.CASE_INSENSITIVE);
@@ -727,14 +923,15 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                     if (pkMatcher.find()) {
                         String pkName = pkMatcher.group(1) == null ? "" : pkMatcher.group(1);
                         String cols = pkMatcher.group(2);
-                        gdbSql.append("ALTER TABLE ").append(tableName)
+                        sb.append("ALTER TABLE ").append(tableName)
                                 .append(" ADD CONSTRAINT ");
                         if (pkName != null && !pkName.isEmpty()) {
-                            gdbSql.append(cleanIdentifier(pkName)).append(" ");
+                            sb.append(cleanIdentifier(pkName)).append(" ");
                         }
-                        gdbSql.append("PRIMARY KEY (")
+                        sb.append("PRIMARY KEY (")
                                 .append(parseAndJoinCols(cols))
                                 .append(");\n\n");
+                        addRawSql(sb.toString());
                         continue;
                     }
                     Pattern uqPattern = Pattern.compile(
@@ -744,37 +941,39 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                     if (uqMatcher.find()) {
                         String uqName = uqMatcher.group(1) == null ? "" : uqMatcher.group(1);
                         String cols = uqMatcher.group(2);
-                        gdbSql.append("ALTER TABLE ").append(tableName)
+                        sb.append("ALTER TABLE ").append(tableName)
                                 .append(" ADD CONSTRAINT ");
                         if (uqName != null && !uqName.isEmpty()) {
-                            gdbSql.append(cleanIdentifier(uqName)).append(" ");
+                            sb.append(cleanIdentifier(uqName)).append(" ");
                         }
-                        gdbSql.append("UNIQUE (")
+                        sb.append("UNIQUE (")
                                 .append(parseAndJoinCols(cols))
                                 .append(");\n\n");
+                        addRawSql(sb.toString());
                         continue;
                     }
                     Pattern fkPattern = Pattern.compile(
-                            "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*FOREIGN KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([`'\"]?[\\w\\.]+[`'\"]?)\\s*\\(([^)]+)\\)",
-                            Pattern.CASE_INSENSITIVE);
+                            "CONSTRAINT\\s+([`'\"][^`'\"]+[`'\"]|[\\w_]+)?\\s*FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
+                            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
                     Matcher fkMatcher = fkPattern.matcher(idxStr);
                     if (fkMatcher.find()) {
                         String fkName = fkMatcher.group(1) == null ? "" : fkMatcher.group(1);
                         String localCols = fkMatcher.group(2);
                         String refTable = fkMatcher.group(3);
                         String refCols = fkMatcher.group(4);
-                        gdbSql.append("ALTER TABLE ").append(tableName)
+                        sb.append("ALTER TABLE ").append(tableName)
                                 .append(" ADD CONSTRAINT ");
-                        if (fkName != null && !fkName.isEmpty()) {
-                            gdbSql.append(cleanIdentifier(fkName)).append(" ");
+                        if (fkName != null && !fkName.trim().isEmpty()) {
+                            sb.append(cleanIdentifier(fkName.trim())).append(" ");
                         }
-                        gdbSql.append("FOREIGN KEY (")
+                        sb.append("FOREIGN KEY (")
                                 .append(parseAndJoinCols(localCols))
                                 .append(") REFERENCES ")
-                                .append(getFullTableNameStr(refTable))
+                                .append(cleanIdentifier(getTableNameOnly(refTable)))
                                 .append(" (")
                                 .append(parseAndJoinCols(refCols))
                                 .append(");\n\n");
+                        addRawSql(sb.toString());
                         continue;
                     }
                     Pattern checkPattern = Pattern.compile(
@@ -783,19 +982,20 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                     if (checkMatcher.find()) {
                         String checkName = checkMatcher.group(1) == null ? "" : checkMatcher.group(1);
                         String checkExpr = checkMatcher.group(2).trim();
-                        gdbSql.append("ALTER TABLE ").append(tableName)
+                        sb.append("ALTER TABLE ").append(tableName)
                                 .append(" ADD CONSTRAINT ");
                         if (checkName != null && !checkName.isEmpty()) {
-                            gdbSql.append(cleanIdentifier(checkName)).append(" ");
+                            sb.append(cleanIdentifier(checkName)).append(" ");
                         }
-                        gdbSql.append("CHECK (").append(checkExpr).append(");\n\n");
+                        sb.append("CHECK (").append(checkExpr).append(");\n\n");
+                        addRawSql(sb.toString());
                         continue;
                     }
                 }
             }
         } else {
             String s = alter.toString();
-            gdbSql.append(s).append(";\n\n");
+            addRawSql(s + ";\n\n");
         }
     }
 
@@ -812,17 +1012,18 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
         } catch (Exception e) {
             tableName = cleanIdentifier(insert.getTable().getName());
         }
-        gdbSql.append("INSERT INTO ").append(tableName);
+        StringBuilder sb = new StringBuilder();
+        sb.append("INSERT INTO ").append(tableName);
 
         List<Column> columns = insert.getColumns();
         if (columns != null && !columns.isEmpty()) {
-            gdbSql.append("(");
+            sb.append("(");
             for (int i = 0; i < columns.size(); i++) {
                 String colName = cleanIdentifier(columns.get(i).getColumnName());
-                gdbSql.append(colName);
-                if (i < columns.size() - 1) gdbSql.append(", ");
+                sb.append(colName);
+                if (i < columns.size() - 1) sb.append(", ");
             }
-            gdbSql.append(")");
+            sb.append(")");
         }
 
         String valuesStr = insert.toString().toUpperCase();
@@ -835,7 +1036,8 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
             valuesPart = replaceBooleanLiteralsForGDB(valuesPart);
         }
 
-        gdbSql.append(" VALUES").append(valuesPart).append(";\n\n");
+        sb.append(" VALUES").append(valuesPart).append(";\n\n");
+        addRawSql(sb.toString());
     }
 
     @Override
@@ -851,7 +1053,8 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
         } catch (Exception e) {
             tableName = cleanIdentifier(update.getTable().getName());
         }
-        gdbSql.append("UPDATE ").append(tableName).append(" SET ");
+        StringBuilder sb = new StringBuilder();
+        sb.append("UPDATE ").append(tableName).append(" SET ");
 
         List<Column> cols = update.getColumns();
         List<Expression> exprs = update.getExpressions();
@@ -861,10 +1064,11 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
             valueExpr = valueExpr.replace("SYSDATE", "NOW()");
             valueExpr = valueExpr.replace("CURRENT_TIMESTAMP", "NOW()");
             valueExpr = replaceBooleanLiteralsForGDB(valueExpr);
-            gdbSql.append(colName).append("=").append(valueExpr);
-            if (i < cols.size() - 1) gdbSql.append(", ");
+            sb.append(colName).append("=").append(valueExpr);
+            if (i < cols.size() - 1) sb.append(", ");
         }
-        gdbSql.append(processWhereExpression(update.getWhere())).append(";\n\n");
+        sb.append(processWhereExpression(update.getWhere())).append(";\n\n");
+        addRawSql(sb.toString());
     }
 
     @Override
@@ -880,11 +1084,21 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
         } catch (Exception e) {
             tableName = cleanIdentifier(delete.getTable().getName());
         }
-        gdbSql.append("DELETE FROM ").append(tableName);
-        gdbSql.append(processWhereExpression(delete.getWhere())).append(";\n\n");
+        StringBuilder sb = new StringBuilder();
+        sb.append("DELETE FROM ").append(tableName);
+        sb.append(processWhereExpression(delete.getWhere())).append(";\n\n");
+        addRawSql(sb.toString());
     }
 
     public String getGdbSql() {
-        return gdbSql.toString();
+        StringBuilder result = new StringBuilder();
+        for (Chunk c : chunks) {
+            if (c.type == ChunkType.CREATE_TABLE) {
+                result.append(renderCreateTable(c.createTable));
+            } else if (c.rawSql != null) {
+                result.append(c.rawSql);
+            }
+        }
+        return result.toString();
     }
 }

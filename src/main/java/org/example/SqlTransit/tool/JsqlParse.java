@@ -15,28 +15,38 @@ import java.util.Set;
 public class JsqlParse {
 
     public static void main(String[] args) throws Exception {
-        Scanner scanner = new Scanner(System.in);
-        System.out.print("请输入SQL脚本文件路径: ");
-        String filePath = scanner.nextLine();
-
-        String sql;
-        try {
-            sql = Files.readString(Paths.get(filePath));
-        } catch (Exception e) {
-            System.err.println("读取文件失败: " + e.getMessage());
-            return;
-        }
-
-        Statements statements;
-        try {
-            statements = CCJSqlParserUtil.parseStatements(sql);
-        } catch (Exception e) {
-            System.err.println("SQL解析失败: " + e.getMessage());
-            return;
-        }
-        for (Statement stmt : statements.getStatements()) {
-            printAst(stmt, 0, new HashSet<>());
-            System.out.println();
+        try (Scanner scanner = new Scanner(System.in)) {
+            while (true) {
+                System.out.print("请输入SQL脚本文件路径: ");
+                String filePath = scanner.nextLine();
+                
+                // 读取文件
+                String sql = null;
+                try {
+                    sql = Files.readString(Paths.get(filePath));
+                } catch (Exception e) {
+                    System.err.println("读取文件失败: " + e.getMessage());
+                    System.err.println("请重新输入文件路径。\n");
+                    continue;
+                }
+                
+                // 解析SQL
+                Statements statements;
+                try {
+                    statements = CCJSqlParserUtil.parseStatements(sql);
+                } catch (Exception e) {
+                    System.err.println("SQL解析失败: " + e.getMessage());
+                    System.err.println("请重新输入文件路径。\n");
+                    continue;
+                }
+                
+                // 解析成功，打印AST
+                for (Statement stmt : statements.getStatements()) {
+                    printAst(stmt, 0, new HashSet<>());
+                    System.out.println();
+                }
+                break; // 成功解析后退出循环
+            }
         }
     }
     // 递归打印对象树

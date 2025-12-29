@@ -1,0 +1,190 @@
+package org.example.SqlTransit.tool;
+
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+
+/**
+ * Oracle SQL 预处理类
+ * 移除 JSqlParser 无法处理的 Oracle 特殊语法
+ */
+public class oraclePreProcess {
+    
+    /**
+     * 预处理 Oracle SQL，移除特殊语法
+     * 
+     * @param sql 原始 Oracle SQL
+     * @return 处理后的 SQL
+     */
+    public static String preprocess(String sql) {
+        if (sql == null || sql.trim().isEmpty()) {
+            return sql;
+        }
+        
+        String result = sql;
+        
+        // 1. 先移除 USING INDEX ... ENABLE 整个子句（包括所有配置）
+        // 必须在移除单独的 ENABLE 之前处理，避免误删
+        result = removeUsingIndexClause(result);
+        
+        // 2. 移除约束后的 ENABLE 关键字（在约束定义末尾）
+        result = removeConstraintEnable(result);
+        
+        // 3. 移除表定义后的存储配置（SEGMENT CREATION, PCTFREE, PCTUSED, INITRANS, MAXTRANS, NOCOMPRESS, LOGGING, STORAGE, TABLESPACE 等）
+        result = removeTableStorageClause(result);
+        
+        // 4. 移除索引定义列括号内最后的逗号和数字参数（例如：("TENANT_ID_", 0) -> ("TENANT_ID_")）
+        result = removeIndexColumnNumericParameter(result);
+        
+        // 5. 移除索引定义后的存储配置（PCTFREE, INITRANS, MAXTRANS, COMPUTE STATISTICS, STORAGE, TABLESPACE 等）
+        result = removeIndexStorageClause(result);
+        
+        // 6. 替换 NUMBER(*,0) 中的 * 为 38
+        result = replaceNumberWildcard(result);
+        
+        // 7. 清理多余的空格和换行
+        result = cleanWhitespace(result);
+        
+        return result;
+    }
+    
+    /**
+     * 移除 USING INDEX ... ENABLE 整个子句
+     * 包括 USING INDEX 及其后的所有配置直到 ENABLE
+     */
+    private static String removeUsingIndexClause(String sql) {
+        // 匹配 USING INDEX 到 ENABLE 之间的所有内容（包括多行）
+        // 需要匹配括号内的内容（STORAGE(...)等），使用非贪婪匹配
+        Pattern pattern = Pattern.compile(
+            "(?i)\\s+USING\\s+INDEX[\\s\\S]*?ENABLE\\s*",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+        );
+        return pattern.matcher(sql).replaceAll(" ");
+    }
+    
+    /**
+     * 移除约束后的 ENABLE 关键字
+     * 例如：CONSTRAINT "PK_XXX" PRIMARY KEY (...) ENABLE
+     * 或：CONSTRAINT "CKT_XXX" CHECK (...) ENABLE
+     */
+    private static String removeConstraintEnable(String sql) {
+        // 匹配约束定义末尾的 ENABLE（在逗号、右括号或换行前）
+        Pattern pattern = Pattern.compile(
+            "(?i)\\s+ENABLE\\s*(?=[,\\)\\n])",
+            Pattern.CASE_INSENSITIVE | Pattern.MULTILINE
+        );
+        return pattern.matcher(sql).replaceAll("");
+    }
+    
+    /**
+     * 移除表定义后的存储配置
+     * 包括：SEGMENT CREATION IMMEDIATE, PCTFREE, PCTUSED, INITRANS, MAXTRANS, 
+     * NOCOMPRESS, LOGGING, STORAGE(...), TABLESPACE 等
+     */
+    private static String removeTableStorageClause(String sql) {
+        // 匹配表定义结束后的所有存储配置（从 ) 后到 ; 前）
+        // 需要匹配多行，包括嵌套的括号（STORAGE(...)）
+        // 使用非贪婪匹配，直到遇到分号
+        Pattern pattern = Pattern.compile(
+            "(?i)\\s*\\)\\s+(SEGMENT\\s+CREATION[\\s\\S]*?|PCTFREE[\\s\\S]*?|PCTUSED[\\s\\S]*?|INITRANS[\\s\\S]*?|MAXTRANS[\\s\\S]*?|NOCOMPRESS[\\s\\S]*?|LOGGING[\\s\\S]*?|STORAGE[\\s\\S]*?|TABLESPACE[\\s\\S]*?);",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+        );
+        Matcher matcher = pattern.matcher(sql);
+        if (matcher.find()) {
+            // 找到匹配，替换为 ) ;
+            return matcher.replaceAll(" ) ;");
+        }
+        
+        return sql;
+    }
+    
+    /**
+     * 移除索引定义列括号内最后的逗号和数字参数
+     * 例如：("TENANT_ID_", 0) -> ("TENANT_ID_")
+     *       ("COL1", "COL2", 0) -> ("COL1", "COL2")
+     */
+    private static String removeIndexColumnNumericParameter(String sql) {
+        // 匹配 CREATE INDEX 语句中列定义括号内的数字参数
+        // 模式：CREATE INDEX ... ON table (列名列表, 数字) 
+        // 匹配括号内的最后一部分：逗号+数字，然后移除
+        // 使用更灵活的模式，支持带引号的表名和schema前缀
+        Pattern pattern = Pattern.compile(
+            "(?i)(CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+[^\\s]+\\s+ON\\s+[^\\s(]+\\s*\\([^)]+?)(,\\s*\\d+\\s*)(\\))",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+        );
+        
+        Matcher matcher = pattern.matcher(sql);
+        StringBuffer sb = new StringBuffer();
+        while (matcher.find()) {
+            // 保留括号开始和列名部分，移除逗号和数字，保留右括号
+            matcher.appendReplacement(sb, matcher.group(1) + matcher.group(3));
+        }
+        matcher.appendTail(sb);
+        
+        return sb.toString();
+    }
+    
+    /**
+     * 移除索引定义后的存储配置
+     * 包括：PCTFREE, INITRANS, MAXTRANS, COMPUTE STATISTICS, STORAGE(...), TABLESPACE 等
+     */
+    private static String removeIndexStorageClause(String sql) {
+        // 匹配索引定义后的存储配置（从 ) 后到 ; 前）
+        // 模式：ON table (columns) 后的所有配置
+        // 需要匹配多行，包括嵌套的括号
+        Pattern pattern = Pattern.compile(
+            "(?i)\\)\\s+(PCTFREE[\\s\\S]*?|INITRANS[\\s\\S]*?|MAXTRANS[\\s\\S]*?|COMPUTE\\s+STATISTICS[\\s\\S]*?|STORAGE[\\s\\S]*?|TABLESPACE[\\s\\S]*?);",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+        );
+        Matcher matcher = pattern.matcher(sql);
+        if (matcher.find()) {
+            // 替换为 ) ;
+            return matcher.replaceAll(" ) ;");
+        }
+        
+        return sql;
+    }
+    
+    /**
+     * 替换 NUMBER(*,0) 中的 * 为 38
+     * 例如：NUMBER(*,0) -> NUMBER(38,0)
+     *       NUMBER(*, 0) -> NUMBER(38, 0)
+     */
+    private static String replaceNumberWildcard(String sql) {
+        // 匹配 NUMBER(*,0) 或 NUMBER(*, 0) 格式，支持空格
+        Pattern pattern = Pattern.compile(
+            "(?i)NUMBER\\s*\\(\\s*\\*\\s*,\\s*0\\s*\\)",
+            Pattern.CASE_INSENSITIVE
+        );
+        return pattern.matcher(sql).replaceAll("NUMBER(38, 0)");
+    }
+    
+    /**
+     * 清理多余的空格和换行
+     */
+    private static String cleanWhitespace(String sql) {
+        // 将多个连续空格替换为单个空格
+        sql = sql.replaceAll(" +", " ");
+        // 将多个连续换行替换为单个换行
+        sql = sql.replaceAll("\n{3,}", "\n\n");
+        // 移除行尾空格
+        sql = sql.replaceAll(" +\n", "\n");
+        return sql.trim();
+    }
+    
+    /**
+     * 批量预处理多条 SQL 语句
+     * 
+     * @param sqls SQL 语句数组
+     * @return 处理后的 SQL 语句数组
+     */
+    public static String[] preprocessBatch(String[] sqls) {
+        if (sqls == null) {
+            return null;
+        }
+        String[] results = new String[sqls.length];
+        for (int i = 0; i < sqls.length; i++) {
+            results[i] = preprocess(sqls[i]);
+        }
+        return results;
+    }
+}

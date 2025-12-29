@@ -151,6 +151,16 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         return " WHERE " + expr;
     }
 
+    // 工具方法：生成主键约束名称（格式：pk_列名，小写）
+    private String generatePrimaryKeyConstraintName(String tableName, List<String> primaryKeyCols) {
+        if (primaryKeyCols == null || primaryKeyCols.isEmpty()) {
+            return "pk_" + tableName.toLowerCase();
+        }
+        // 使用第一个列名生成约束名：pk_列名（小写）
+        String firstCol = primaryKeyCols.get(0).toLowerCase();
+        return "pk_" + firstCol;
+    }
+
     // 工具方法：提取表的注释（获取CREATE TABLE末尾的COMMENT='xxx'）
     private String extractTableComment(CreateTable createTable) {
         // 方法1：直接访问 tableOptionsStrings
@@ -299,6 +309,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         oracleSql.append("CREATE TABLE ").append(tableName).append(" (\n");
 
         List<ColumnDefinition> columns = createTable.getColumnDefinitions();
+        boolean hasColumnLevelPrimaryKey = false; // 记录是否有列级主键
 
         for (int i = 0; i < columns.size(); i++) {
             ColumnDefinition col = columns.get(i);
@@ -440,6 +451,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
             // 约束顺序：主键 > 唯一 > 非空
             if (isPrimaryKey) {
                 oracleSql.append(" PRIMARY KEY");
+                hasColumnLevelPrimaryKey = true; // 标记已有列级主键
             } else {
                 if (isUnique) {
                     oracleSql.append(" UNIQUE");
@@ -459,7 +471,178 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
 
         }
 
+        // 处理表级 PRIMARY KEY（如果列级没有主键）
+        List<String> tablePrimaryKeyCols = new ArrayList<>();
+        if (!hasColumnLevelPrimaryKey) {
+            try {
+                java.lang.reflect.Method getIndexesMethod = CreateTable.class.getMethod("getIndexes");
+                List<?> indexes = (List<?>) getIndexesMethod.invoke(createTable);
+                if (indexes != null) {
+                    for (Object idx : indexes) {
+                        String idxStr = idx.toString().trim().toUpperCase();
+                        if (idxStr.contains("PRIMARY KEY")) {
+                            // 尝试获取列名
+                            try {
+                                java.lang.reflect.Method getColumnsNamesMethod = idx.getClass().getMethod("getColumnsNames");
+                                Object pkColsObj = getColumnsNamesMethod.invoke(idx);
+                                if (pkColsObj instanceof List) {
+                                    for (Object colObj : (List<?>) pkColsObj) {
+                                        String colName = cleanIdentifier(colObj.toString());
+                                        tablePrimaryKeyCols.add(colName);
+                                    }
+                                }
+                            } catch (Exception e) {
+                                // 如果反射失败，尝试从字符串解析
+                                Pattern pkPattern = Pattern.compile(
+                                        "PRIMARY KEY\\s*\\(([^)]+)\\)", Pattern.CASE_INSENSITIVE);
+                                Matcher m = pkPattern.matcher(idxStr);
+                                if (m.find()) {
+                                    String cols = m.group(1);
+                                    String[] colArr = cols.split(",");
+                                    for (String col : colArr) {
+                                        tablePrimaryKeyCols.add(cleanIdentifier(col.trim()));
+                                    }
+                                }
+                            }
+                            break; // 只处理第一个主键约束
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // 如果反射失败，尝试从 toString() 解析
+                String createStr = createTable.toString();
+                Pattern pkPattern = Pattern.compile(
+                        "PRIMARY KEY\\s*\\(([^)]+)\\)", Pattern.CASE_INSENSITIVE);
+                Matcher m = pkPattern.matcher(createStr);
+                if (m.find()) {
+                    String cols = m.group(1);
+                    String[] colArr = cols.split(",");
+                    for (String col : colArr) {
+                        tablePrimaryKeyCols.add(cleanIdentifier(col.trim()));
+                    }
+                }
+            }
+
+            // 如果有表级主键，添加到 CREATE TABLE 中（使用CONSTRAINT格式）
+            if (!tablePrimaryKeyCols.isEmpty()) {
+                String pkConstraintName = generatePrimaryKeyConstraintName(tableName, tablePrimaryKeyCols);
+                oracleSql.append(",\n    CONSTRAINT ").append(pkConstraintName)
+                        .append(" PRIMARY KEY (").append(String.join(", ", tablePrimaryKeyCols)).append(")");
+            }
+        }
+
         oracleSql.append("\n);\n\n");
+
+        // 处理表级索引（在 CREATE TABLE 之后生成单独的 CREATE INDEX 语句）
+        try {
+            java.lang.reflect.Method getIndexesMethod = CreateTable.class.getMethod("getIndexes");
+            List<?> indexes = (List<?>) getIndexesMethod.invoke(createTable);
+            if (indexes != null && !indexes.isEmpty()) {
+                for (Object idx : indexes) {
+                    String idxStr = idx.toString().trim();
+                    String idxStrUpper = idxStr.toUpperCase();
+
+                    // 跳过主键索引（已经在 CREATE TABLE 中处理）
+                    if (idxStrUpper.contains("PRIMARY KEY")) {
+                        continue;
+                    }
+
+                    // 判断是否是唯一索引
+                    boolean isUnique = idxStrUpper.contains("UNIQUE");
+                    String idxName = null;
+                    List<String> idxColumns = new ArrayList<>();
+
+                    // 尝试获取索引名和列名
+                    try {
+                        java.lang.reflect.Method getNameMethod = idx.getClass().getMethod("getName");
+                        Object nameObj = getNameMethod.invoke(idx);
+                        if (nameObj != null) {
+                            idxName = cleanIdentifier(nameObj.toString());
+                        }
+                    } catch (Exception e) {
+                        // 忽略
+                    }
+
+                    try {
+                        java.lang.reflect.Method getColumnsNamesMethod = idx.getClass().getMethod("getColumnsNames");
+                        Object colsObj = getColumnsNamesMethod.invoke(idx);
+                        if (colsObj instanceof List) {
+                            for (Object colObj : (List<?>) colsObj) {
+                                idxColumns.add(cleanIdentifier(colObj.toString()));
+                            }
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从字符串解析
+                        Pattern indexPattern = Pattern.compile(
+                                "(?:UNIQUE\\s+)?(?:KEY|INDEX)\\s+(?:[`'\"]?\\w+[`'\"]?\\s+)?\\(([^)]+)\\)",
+                                Pattern.CASE_INSENSITIVE);
+                        Matcher m = indexPattern.matcher(idxStr);
+                        if (m.find()) {
+                            String cols = m.group(1);
+                            String[] colArr = cols.split(",");
+                            for (String col : colArr) {
+                                idxColumns.add(cleanIdentifier(col.trim()));
+                            }
+                        }
+                    }
+
+                    // 如果没有获取到索引名，尝试从字符串解析
+                    if (idxName == null || idxName.isEmpty()) {
+                        Pattern namePattern = Pattern.compile(
+                                "(?:UNIQUE\\s+)?(?:KEY|INDEX)\\s+([`'\"]?\\w+[`'\"]?)",
+                                Pattern.CASE_INSENSITIVE);
+                        Matcher m = namePattern.matcher(idxStr);
+                        if (m.find()) {
+                            idxName = cleanIdentifier(m.group(1));
+                        } else {
+                            // 如果没有索引名，生成一个默认名称
+                            idxName = "IDX_" + tableName + "_" + String.join("_", idxColumns);
+                        }
+                    }
+
+                    // 如果成功获取到列名，生成 CREATE INDEX 语句
+                    if (!idxColumns.isEmpty()) {
+                        oracleSql.append("CREATE");
+                        if (isUnique) {
+                            oracleSql.append(" UNIQUE");
+                        }
+                        oracleSql.append(" INDEX ").append(idxName)
+                                .append(" ON ").append(tableName)
+                                .append(" (").append(String.join(", ", idxColumns)).append(");\n\n");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // 如果反射失败，尝试从 toString() 解析索引
+            String createStr = createTable.toString();
+            Pattern indexPattern = Pattern.compile(
+                    "(?i)(UNIQUE\\s+)?(?:KEY|INDEX)\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher idxMatcher = indexPattern.matcher(createStr);
+            while (idxMatcher.find()) {
+                boolean isUnique = idxMatcher.group(1) != null;
+                String idxName = cleanIdentifier(idxMatcher.group(2));
+                String indexColumns = idxMatcher.group(3);
+                String[] colArr = indexColumns.split(",");
+                List<String> idxColumns = new ArrayList<>();
+                for (String col : colArr) {
+                    idxColumns.add(cleanIdentifier(col.trim()));
+                }
+
+                // 跳过主键索引
+                if (idxName.toUpperCase().contains("PRIMARY")) {
+                    continue;
+                }
+
+                oracleSql.append("CREATE");
+                if (isUnique) {
+                    oracleSql.append(" UNIQUE");
+                }
+                oracleSql.append(" INDEX ").append(idxName)
+                        .append(" ON ").append(tableName)
+                        .append(" (").append(String.join(", ", idxColumns)).append(");\n\n");
+            }
+        }
 
         // 表级注释处理 - 修复方法
         String tableComment = extractTableComment(createTable);

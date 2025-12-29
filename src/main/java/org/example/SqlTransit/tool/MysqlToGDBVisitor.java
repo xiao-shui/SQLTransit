@@ -9,6 +9,7 @@ import net.sf.jsqlparser.statement.update.Update;
 import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.statement.StatementVisitorAdapter;
+import net.sf.jsqlparser.statement.create.table.Index;
 
 import java.util.*;
 import java.util.regex.Matcher;
@@ -24,6 +25,11 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
             "SCHEMA", "GLOBAL", "LOCAL", "CLUSTER", "REPLICA",
             "SEQUENCE", "SHARDING", "DISTRIBUTED"
     ));
+
+    // 新增：GoldenDB索引类型枚举
+    private enum GDBIndexType {
+        GLOBAL, LOCAL, NORMAL
+    }
 
     private String cleanIdentifier(String name) {
         if (name == null) return null;
@@ -222,7 +228,6 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
                 return "TINYINT(1)";
             case "ENUM":
                 if (args != null && !args.isEmpty()) {
-                    // String.join is not available for List<?>, so use helper function
                     return "ENUM(" + argsToJoinedString(args) + ")";
                 }
                 return "ENUM('Y','N')";
@@ -258,6 +263,119 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
             }
 
             tableShardingInfo.put(tableName, shardKeyList);
+        }
+    }
+
+    // 新增：判断索引类型（全局/本地）
+    private GDBIndexType getIndexType(String tableName, List<String> indexColumns) {
+        List<String> shardKeys = tableShardingInfo.get(tableName);
+        if (shardKeys == null || shardKeys.isEmpty()) {
+            return GDBIndexType.NORMAL;
+        }
+        // 若索引包含分片键，默认转为本地索引；否则转为全局索引
+        for (String col : indexColumns) {
+            if (shardKeys.contains(col)) {
+                return GDBIndexType.LOCAL;
+            }
+        }
+        return GDBIndexType.GLOBAL;
+    }
+
+    // 新增：处理CreateTable中的表级索引
+    private void processTableIndexes(CreateTable createTable, String tableName) {
+        try {
+            // 反射获取CreateTable中的索引列表
+            java.lang.reflect.Method getIndexesMethod = CreateTable.class.getMethod("getIndexes");
+            List<Index> indexes = (List<Index>) getIndexesMethod.invoke(createTable);
+
+            if (indexes != null && !indexes.isEmpty()) {
+                for (Index idx : indexes) {
+                    String idxName = cleanIdentifier(idx.getName());
+                    if (idxName == null || idxName.isEmpty()) {
+                        // 自动生成索引名
+                        idxName = "idx_" + tableName + "_" + String.join("_", idx.getColumnsNames());
+                    }
+
+                    // Replaced idx.isUnique() and idx.isPrimary() with heuristics:
+                    // isUnique: name contains "UK_" or "UNIQUE" (case-insensitive) or toString contains "UNIQUE"
+                    boolean isUnique = false;
+                    boolean isPrimary = false;
+                    String idxNameRaw = idx.getName() != null ? idx.getName().toUpperCase() : "";
+                    String idxStr = idx.toString().toUpperCase();
+
+                    if (idxNameRaw.contains("UK_") || idxNameRaw.contains("UNIQUE") || idxStr.contains("UNIQUE")) {
+                        isUnique = true;
+                    }
+                    // isPrimary: name contains "PK_" or "PRIMARY" or idx definition string contains "PRIMARY KEY"
+                    if (idxNameRaw.contains("PK_") || idxNameRaw.contains("PRIMARY") || idxStr.contains("PRIMARY KEY")) {
+                        isPrimary = true;
+                    }
+
+                    List<String> idxColumns = new ArrayList<>();
+                    for (Object colObj : idx.getColumnsNames()) {
+                        idxColumns.add(cleanIdentifier(colObj.toString()));
+                    }
+
+                    // 跳过主键索引（已在字段定义中处理）
+                    if (isPrimary) {
+                        continue;
+                    }
+
+                    // 获取GoldenDB索引类型
+                    GDBIndexType idxType = getIndexType(tableName, idxColumns);
+
+                    // 构建索引SQL
+                    goldenDbSql.append("\n");
+                    goldenDbSql.append("CREATE ");
+                    if (isUnique) {
+                        goldenDbSql.append("UNIQUE ");
+                    }
+                    goldenDbSql.append("INDEX ").append(idxName);
+                    // 追加GoldenDB分布式索引类型
+                    if (idxType == GDBIndexType.GLOBAL) {
+                        goldenDbSql.append(" GLOBAL");
+                    } else if (idxType == GDBIndexType.LOCAL) {
+                        goldenDbSql.append(" LOCAL");
+                    }
+                    goldenDbSql.append(" ON ").append(tableName)
+                            .append(" (").append(String.join(", ", idxColumns)).append(")");
+                    // 补充索引存储类型（默认BTREE）
+                    goldenDbSql.append(" USING BTREE;");
+                }
+            }
+        } catch (Exception e) {
+            // 兼容低版本JSqlParser
+            String createStr = createTable.toString();
+            Pattern indexPattern = Pattern.compile(
+                    "(?i)(UNIQUE\\s+)?KEY\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
+                    Pattern.CASE_INSENSITIVE
+            );
+            Matcher idxMatcher = indexPattern.matcher(createStr);
+            while (idxMatcher.find()) {
+                boolean isUnique = idxMatcher.group(1) != null;
+                String idxName = cleanIdentifier(idxMatcher.group(2));
+                String columns = idxMatcher.group(3);
+                String[] colArr = columns.split(",");
+                List<String> idxColumns = new ArrayList<>();
+                for (String col : colArr) {
+                    idxColumns.add(cleanIdentifier(col.trim()));
+                }
+
+                GDBIndexType idxType = getIndexType(tableName, idxColumns);
+                goldenDbSql.append("\n");
+                goldenDbSql.append("CREATE ");
+                if (isUnique) {
+                    goldenDbSql.append("UNIQUE ");
+                }
+                goldenDbSql.append("INDEX ").append(idxName);
+                if (idxType == GDBIndexType.GLOBAL) {
+                    goldenDbSql.append(" GLOBAL");
+                } else if (idxType == GDBIndexType.LOCAL) {
+                    goldenDbSql.append(" LOCAL");
+                }
+                goldenDbSql.append(" ON ").append(tableName)
+                        .append(" (").append(String.join(", ", idxColumns)).append(") USING BTREE;");
+            }
         }
     }
 
@@ -432,8 +550,6 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
 
             if (isNotNull) {
                 goldenDbSql.append(" NOT NULL");
-            } else if (!isPrimaryKey) {
-                goldenDbSql.append(" NULL");
             }
 
             if (isPrimaryKey) {
@@ -474,7 +590,11 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
         goldenDbSql.append(" DEFAULT CHARSET=utf8mb4");
         goldenDbSql.append(" COLLATE=utf8mb4_general_ci");
 
-        goldenDbSql.append(";\n\n");
+        goldenDbSql.append(";\n");
+
+        // 新增：处理表内索引（表级索引）
+        processTableIndexes(createTable, tableName);
+        goldenDbSql.append("\n");
 
         // 添加分片键语句
         List<String> shardKeys = tableShardingInfo.get(tableName);
@@ -589,10 +709,12 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
         return tokens;
     }
 
+    // 增强：CreateIndex的转换逻辑，适配GoldenDB分布式索引
     @Override
     public void visit(CreateIndex createIndex) {
         String indexName = cleanIdentifier(createIndex.getIndex().getName());
         String tableName = cleanIdentifier(createIndex.getTable().getName());
+        // Remove use of .isUnique(); only use heuristics
         boolean isUnique = createIndex.toString().toUpperCase().contains("UNIQUE") ||
                 (indexName != null && indexName.toUpperCase().startsWith("UNIQUE_"));
 
@@ -623,17 +745,31 @@ public class MysqlToGDBVisitor extends StatementVisitorAdapter {
             }
         }
 
+        // 获取GoldenDB索引类型（全局/本地）
+        GDBIndexType idxType = getIndexType(tableName, columns);
+
         goldenDbSql.append("CREATE");
         if (isUnique) goldenDbSql.append(" UNIQUE");
-        goldenDbSql.append(" INDEX ").append(indexName)
-                .append(" ON ").append(tableName)
+        goldenDbSql.append(" INDEX ").append(indexName);
+
+        // 追加分布式索引类型
+        if (idxType == GDBIndexType.GLOBAL) {
+            goldenDbSql.append(" GLOBAL");
+        } else if (idxType == GDBIndexType.LOCAL) {
+            goldenDbSql.append(" LOCAL");
+        }
+
+        goldenDbSql.append(" ON ").append(tableName)
                 .append(" (").append(String.join(", ", columns)).append(")");
 
+        // 补充索引存储引擎（默认BTREE，兼容MySQL）
         String indexStr = createIndex.toString();
         if (indexStr.toUpperCase().contains("USING BTREE")) {
             goldenDbSql.append(" USING BTREE");
         } else if (indexStr.toUpperCase().contains("USING HASH")) {
             goldenDbSql.append(" USING HASH");
+        } else {
+            goldenDbSql.append(" USING BTREE");
         }
 
         goldenDbSql.append(";\n\n");
