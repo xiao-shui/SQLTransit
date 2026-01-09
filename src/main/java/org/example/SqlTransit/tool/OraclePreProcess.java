@@ -2,12 +2,14 @@ package org.example.SqlTransit.tool;
 
 import java.util.regex.Pattern;
 import java.util.regex.Matcher;
+import java.util.Set;
+import java.util.LinkedHashSet;
 
 /**
  * Oracle SQL 预处理类
  * 移除 JSqlParser 无法处理的 Oracle 特殊语法
  */
-public class oraclePreProcess {
+public class OraclePreProcess {
     
     /**
      * 预处理 Oracle SQL，移除特殊语法
@@ -38,10 +40,13 @@ public class oraclePreProcess {
         // 5. 移除索引定义后的存储配置（PCTFREE, INITRANS, MAXTRANS, COMPUTE STATISTICS, STORAGE, TABLESPACE 等）
         result = removeIndexStorageClause(result);
         
-        // 6. 替换 NUMBER(*,0) 中的 * 为 38
+        // 6. 替换 NUMBER(*,X) 中的 * 为 38（X 为任意数字）
         result = replaceNumberWildcard(result);
         
-        // 7. 清理多余的空格和换行
+        // 7. 移除重复的 CREATE UNIQUE INDEX 语句（相同索引名和表名的重复索引）
+        result = removeDuplicateUniqueIndexes(result);
+        
+        // 8. 清理多余的空格和换行
         result = cleanWhitespace(result);
         
         return result;
@@ -145,17 +150,103 @@ public class oraclePreProcess {
     }
     
     /**
-     * 替换 NUMBER(*,0) 中的 * 为 38
-     * 例如：NUMBER(*,0) -> NUMBER(38,0)
-     *       NUMBER(*, 0) -> NUMBER(38, 0)
+     * 替换 NUMBER(*,X) 中的 * 为 38（X 为任意数字）
      */
     private static String replaceNumberWildcard(String sql) {
-        // 匹配 NUMBER(*,0) 或 NUMBER(*, 0) 格式，支持空格
+        // 匹配 NUMBER(*,X) 格式，支持空格，X 为任意数字
         Pattern pattern = Pattern.compile(
-            "(?i)NUMBER\\s*\\(\\s*\\*\\s*,\\s*0\\s*\\)",
+            "(?i)NUMBER\\s*\\(\\s*\\*\\s*,\\s*(\\d+)\\s*\\)",
             Pattern.CASE_INSENSITIVE
         );
-        return pattern.matcher(sql).replaceAll("NUMBER(38, 0)");
+        Matcher matcher = pattern.matcher(sql);
+        StringBuffer sb = new StringBuffer();
+        while (matcher.find()) {
+            String scale = matcher.group(1); // 捕获后面的数字
+            matcher.appendReplacement(sb, "NUMBER(38, " + scale + ")");
+        }
+        matcher.appendTail(sb);
+        return sb.toString();
+    }
+    
+    /**
+     * 移除重复的 CREATE UNIQUE INDEX 语句
+     * 对于相同索引名和表名的重复索引，只保留第一个，移除后续的重复项
+     */
+    private static String removeDuplicateUniqueIndexes(String sql) {
+        // 匹配 CREATE UNIQUE INDEX 语句
+        // 支持格式：CREATE UNIQUE INDEX "schema"."index_name" ON "schema"."table_name" (columns) ;
+        // 或：CREATE UNIQUE INDEX "index_name" ON "table_name" (columns) ;
+        Pattern indexPattern = Pattern.compile(
+            "(?i)(CREATE\\s+UNIQUE\\s+INDEX\\s+[^\\s]+\\s+ON\\s+[^\\s(]+\\s*\\([^)]+\\)\\s*;)",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL
+        );
+        
+        Matcher matcher = indexPattern.matcher(sql);
+        Set<String> seenIndexes = new LinkedHashSet<>(); // 存储已见过的索引（索引名@表名）
+        StringBuilder result = new StringBuilder();
+        int lastEnd = 0;
+        
+        while (matcher.find()) {
+            String indexStatement = matcher.group(1);
+            
+            // 提取索引名和表名
+            // 匹配模式：CREATE UNIQUE INDEX "schema"."index_name" ON "schema"."table_name"
+            // 或：CREATE UNIQUE INDEX "index_name" ON "table_name"
+            Pattern extractPattern = Pattern.compile(
+                "(?i)CREATE\\s+UNIQUE\\s+INDEX\\s+([^\\s]+)\\s+ON\\s+([^\\s(]+)",
+                Pattern.CASE_INSENSITIVE
+            );
+            Matcher extractMatcher = extractPattern.matcher(indexStatement);
+            
+            if (extractMatcher.find()) {
+                String indexFullName = extractMatcher.group(1).trim(); // 可能是 "schema"."index_name" 或 "index_name"
+                String tableFullName = extractMatcher.group(2).trim(); // 可能是 "schema"."table_name" 或 "table_name"
+                
+                // 标准化索引名和表名（去除引号和schema前缀，统一为小写）
+                String normalizedIndexName = normalizeIdentifier(indexFullName);
+                String normalizedTableName = normalizeIdentifier(tableFullName);
+                String indexKey = normalizedIndexName + "@" + normalizedTableName;
+                
+                // 如果这个索引已经出现过，跳过（移除重复）
+                if (seenIndexes.contains(indexKey)) {
+                    // 跳过这个重复的索引语句，不添加到结果中
+                    // 但需要先追加前面未处理的内容，然后跳过当前匹配
+                    result.append(sql.substring(lastEnd, matcher.start()));
+                    lastEnd = matcher.end();
+                } else {
+                    // 首次出现，记录并保留
+                    seenIndexes.add(indexKey);
+                    result.append(sql.substring(lastEnd, matcher.end()));
+                    lastEnd = matcher.end();
+                }
+            } else {
+                // 如果无法提取索引名和表名，保留原语句
+                result.append(sql.substring(lastEnd, matcher.end()));
+                lastEnd = matcher.end();
+            }
+        }
+        
+        // 追加剩余部分
+        result.append(sql.substring(lastEnd));
+        
+        return result.toString();
+    }
+    
+    /**
+     * 标准化标识符：去除引号、schema前缀，统一为小写
+     * 例如："SC_JKZT"."PK_OBJ_TAB_REL" -> "pk_obj_tab_rel"
+     *      "PK_OBJ_TAB_REL" -> "pk_obj_tab_rel"
+     */
+    private static String normalizeIdentifier(String identifier) {
+        if (identifier == null) return "";
+        // 去除所有引号
+        String cleaned = identifier.replaceAll("[\"'`]", "");
+        // 如果有schema前缀（包含点），取最后一部分
+        if (cleaned.contains(".")) {
+            cleaned = cleaned.substring(cleaned.lastIndexOf(".") + 1);
+        }
+        // 统一转为小写
+        return cleaned.toLowerCase().trim();
     }
     
     /**

@@ -15,11 +15,25 @@ import java.util.Set;
 public class JsqlParse {
 
     public static void main(String[] args) throws Exception {
+
+//        String sql = "SELECT id, name, age FROM user WHERE age > 18 AND gender = 'male' ORDER BY id DESC";
+//        // 解析SQL
+//        Statements statements = null;
+//        try {
+//            statements = CCJSqlParserUtil.parseStatements(sql);
+//            // 解析成功，打印AST
+//            for (Statement stmt : statements.getStatements()) {
+//                printAst(stmt, 0, new HashSet<>());
+//                System.out.println();
+//            }
+//        } catch (Exception e) {
+//            System.err.println("SQL解析失败: " + e.getMessage());
+//        }
         try (Scanner scanner = new Scanner(System.in)) {
             while (true) {
                 System.out.print("请输入SQL脚本文件路径: ");
                 String filePath = scanner.nextLine();
-                
+
                 // 读取文件
                 String sql = null;
                 try {
@@ -29,7 +43,7 @@ public class JsqlParse {
                     System.err.println("请重新输入文件路径。\n");
                     continue;
                 }
-                
+
                 // 解析SQL
                 Statements statements;
                 try {
@@ -39,7 +53,7 @@ public class JsqlParse {
                     System.err.println("请重新输入文件路径。\n");
                     continue;
                 }
-                
+
                 // 解析成功，打印AST
                 for (Statement stmt : statements.getStatements()) {
                     printAst(stmt, 0, new HashSet<>());

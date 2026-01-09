@@ -220,8 +220,20 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
             }
             case "VARCHAR2":
             case "VARCHAR":
-                if (args != null && !args.isEmpty()) {
-                    return "VARCHAR(" + args.get(0) + ")";
+                if (args != null && !args.isEmpty() && args.get(0) != null) {
+                    String lenStr = args.get(0).toString().trim();
+                    try {
+                        int len = Integer.parseInt(lenStr);
+                        if (len >= 1000) {
+                            // 长度大于等于 1000，统一转为 TEXT
+                            return "TEXT";
+                        } else {
+                            return "VARCHAR(" + len + ")";
+                        }
+                    } catch (NumberFormatException e) {
+                        // 非数字长度参数，回退为原始形式
+                        return "VARCHAR(" + lenStr + ")";
+                    }
                 }
                 return "VARCHAR";
             case "DATE":
@@ -452,36 +464,31 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
         addRawSql(sb.toString());
     }
 
-    // 辅助方法：获取列规范
+    // 辅助方法：获取列规范（模仿 OracleToMysqlVisitor，实现对 DEFAULT / NOT NULL 的完整保留）
     private List<String> getColumnSpecs(ColumnDefinition col) {
-            List<String> specs = new ArrayList<>();
-            try {
-                java.lang.reflect.Method method = ColumnDefinition.class.getMethod("getColumnSpecStrings");
-                Object result = method.invoke(col);
-                if (result instanceof List) {
-                    for (Object obj : (List<?>) result) {
-                        if (obj != null) {
-                            specs.add(obj.toString().trim());
-                        }
-                    }
-                }
-            } catch (Exception e) {
-                String fullColStr = col.toString();
-                String pattern = Pattern.quote(col.getColumnName()) + "\\s+.*?(?=,\\s*|$)";
-                Pattern r = Pattern.compile(pattern, Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
-                Matcher m = r.matcher(fullColStr);
-
-                if (m.find()) {
-                    String columnDef = m.group();
-                    String colNamePattern = Pattern.quote(col.getColumnName());
-                    String dataTypePattern = Pattern.quote(col.getColDataType().getDataType());
-                    String constraintsOnly = columnDef
-                            .replaceFirst("^" + colNamePattern + "\\s+", "")
-                            .replaceFirst("^" + dataTypePattern + "\\s*", "")
-                            .trim();
-                    specs = parseConstraintTokens(constraintsOnly);
+        List<String> specs = new ArrayList<>();
+        try {
+            // 优先使用 JSqlParser 提供的 getColumnSpecs（适配当前版本）
+            java.lang.reflect.Method method = ColumnDefinition.class.getMethod("getColumnSpecs");
+            @SuppressWarnings("unchecked")
+            List<String> columnSpecs = (List<String>) method.invoke(col);
+            if (columnSpecs != null) {
+                specs.addAll(columnSpecs);
+            }
+        } catch (Exception e) {
+            // 回退：从 toString() 中解析出类型后面的约束片段并切分
+            String colStr = col.toString();
+            int typeEnd = colStr.indexOf(" ", col.getColumnName().length() + 1);
+            if (typeEnd > 0) {
+                String constraintPart = colStr.substring(typeEnd).trim();
+                // 兼容带引号的 token：如 DEFAULT 'x' NOT NULL / COMMENT 'xxx'
+                Pattern pattern = Pattern.compile("([^\\s'\"]+|\"[^\"]*\"|'[^']*')");
+                Matcher matcher = pattern.matcher(constraintPart);
+                while (matcher.find()) {
+                    specs.add(matcher.group());
                 }
             }
+        }
         return specs;
     }
 
@@ -523,8 +530,8 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
 
             // 只有约束名存在且不为空且不是 "null" 时才添加约束名
             String constraintNameClause = "";
-            if (checkName != null && !checkName.trim().isEmpty() && 
-                !checkName.trim().equalsIgnoreCase("null") && 
+            if (checkName != null && !checkName.trim().isEmpty() &&
+                !checkName.trim().equalsIgnoreCase("null") &&
                 !checkName.replaceAll("[`'\"]", "").trim().equalsIgnoreCase("null")) {
                 constraintNameClause = "CONSTRAINT " + cleanIdentifier(checkName) + " ";
             }
@@ -645,7 +652,8 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
         StringBuilder sb = new StringBuilder();
 
         Table table = createTable.getTable();
-        String tableName = cleanIdentifier(table.getName());
+        // 如果存在 schema，则保留 schema.table
+        String tableName = getFullTableName(table);
         currentTableName = tableName;
         sb.append("CREATE TABLE ").append(tableName).append(" (\n");
 
@@ -678,7 +686,7 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                             // 处理 CHECK (column IN (1,0)) ENABLE 格式
                             // 如果带 ENABLE，则：1) 标记字段为 NOT NULL，2) 同时保留 CHECK 约束
                             Pattern inPattern = Pattern.compile(
-                                    "CHECK\\s*\\(\\s*([`'\"][^`'\"]+[`'\"]|[\\w_]+)\\s+IN\\s*\\(([^)]+)\\)\\s*\\)\\s+ENABLE", 
+                                    "CHECK\\s*\\(\\s*([`'\"][^`'\"]+[`'\"]|[\\w_]+)\\s+IN\\s*\\(([^)]+)\\)\\s*\\)\\s+ENABLE",
                                     Pattern.CASE_INSENSITIVE);
                             Matcher inMatcher = inPattern.matcher(idxStr);
                             if (inMatcher.find()) {
@@ -771,10 +779,6 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
 
             sb.append("    ").append(colName).append(" ").append(colType);
 
-            if (isNotNull) {
-                sb.append(" NOT NULL");
-            }
-
             if (defaultValStr != null) {
                 defaultValStr = defaultValStr.trim();
                 if (defaultValStr.contains("SYSDATE") || defaultValStr.contains("CURRENT_TIMESTAMP")) {
@@ -784,10 +788,15 @@ public class OracleToGDBVisitor extends StatementVisitorAdapter {
                 } else if (colType.equalsIgnoreCase("VARCHAR(1)") &&
                         ("'Y'".equalsIgnoreCase(defaultValStr) || "'N'".equalsIgnoreCase(defaultValStr))) {
                     sb.append(" DEFAULT ").append("'Y'".equalsIgnoreCase(defaultValStr) ? "true" : "false");
-            } else {
+                } else {
                     sb.append(" DEFAULT ").append(defaultValStr);
                 }
             }
+
+            if (isNotNull) {
+                sb.append(" NOT NULL");
+            }
+
 
             if (isPrimaryKey) {
                 sb.append(" PRIMARY KEY");

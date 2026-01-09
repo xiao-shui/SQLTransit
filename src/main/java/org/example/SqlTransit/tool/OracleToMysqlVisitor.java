@@ -8,11 +8,16 @@ import net.sf.jsqlparser.expression.DateValue;
 import net.sf.jsqlparser.expression.LongValue;
 import net.sf.jsqlparser.expression.operators.relational.ExpressionList;
 import net.sf.jsqlparser.schema.Column;
+import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.StatementVisitorAdapter;
+import net.sf.jsqlparser.statement.alter.Alter;
+import net.sf.jsqlparser.statement.alter.AlterExpression;
 import net.sf.jsqlparser.statement.comment.Comment;
+import net.sf.jsqlparser.statement.create.index.CreateIndex;
 import net.sf.jsqlparser.statement.create.table.ColumnDefinition;
 import net.sf.jsqlparser.statement.create.table.CreateTable;
 import net.sf.jsqlparser.statement.delete.Delete;
+import net.sf.jsqlparser.statement.drop.Drop;
 import net.sf.jsqlparser.statement.insert.Insert;
 import net.sf.jsqlparser.statement.update.Update;
 
@@ -22,6 +27,25 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class OracleToMysqlVisitor extends StatementVisitorAdapter {
+    private enum ChunkType { CREATE_TABLE, RAW }
+
+    private static class Chunk {
+        final ChunkType type;
+        final CreateTable createTable;
+        final String rawSql;
+        Chunk(CreateTable createTable) {
+            this.type = ChunkType.CREATE_TABLE;
+            this.createTable = createTable;
+            this.rawSql = null;
+        }
+        Chunk(String rawSql) {
+            this.type = ChunkType.RAW;
+            this.createTable = null;
+            this.rawSql = rawSql;
+        }
+    }
+
+    private final List<Chunk> chunks = new ArrayList<>();
     private final StringBuilder mysqlSql = new StringBuilder();
 
     // 收集所有信息，最后统一输出
@@ -44,6 +68,19 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         }
     }
 
+    private String getFullTableName(Table table) {
+        if (table == null) return null;
+        String baseName = cleanIdentifier(table.getName());
+        try {
+            String schema = table.getSchemaName();
+            if (schema != null && !schema.isEmpty()) {
+                return cleanIdentifier(schema) + "." + baseName;
+            }
+        } catch (Exception ignore) {
+        }
+        return baseName;
+    }
+
     private static class ColumnInfo {
         String name;
         String type;
@@ -58,6 +95,15 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
 
     private final Map<String, TableInfo> tables = new LinkedHashMap<>();
     private final List<String> otherStatements = new ArrayList<>(); // INSERT, UPDATE, DELETE等
+    private final Map<String, String> columnComments = new HashMap<>(); // 存储列注释：table.column -> comment
+    private final Map<String, String> tableComments = new HashMap<>(); // 存储表注释：table -> comment
+    private final Map<String, Set<String>> tablePkColsMap = new HashMap<>(); // 表主键列集合，去模式名，用于去重索引
+
+    private void addRawSql(String sql) {
+        if (sql != null && !sql.isEmpty()) {
+            chunks.add(new Chunk(sql));
+        }
+    }
 
     /**
      * 强制清洗标识符为小写（彻底移除引号，转为小写）
@@ -68,13 +114,90 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         return name.replaceAll("^[\"`']+|[\"`']+$", "").toLowerCase(Locale.ROOT).trim();
     }
 
+    /**
+     * 处理表名字符串，去掉schema部分，返回小写表名
+     */
+    private String getTableNameOnly(String raw) {
+        if (raw == null) return null;
+        // 去掉引号
+        String s = raw.replaceAll("[\"`']", "");
+        // 按点分割，取最后一部分作为表名
+        String[] parts = s.split("\\.");
+        String tableName = parts.length > 0 ? parts[parts.length - 1] : s;
+        return tableName.toLowerCase(Locale.ROOT).trim();
+    }
+
+    /**
+     * 去掉schema并清洗名称，返回小写索引名（不带反引号）
+     */
+    private String cleanIdentifierNoSchema(String name) {
+        if (name == null) return null;
+        String cleaned = name.replaceAll("[\"`']", "");
+        if (cleaned.contains(".")) {
+            cleaned = cleaned.substring(cleaned.lastIndexOf(".") + 1);
+        }
+        cleaned = cleaned.trim().toLowerCase(Locale.ROOT);
+        return cleaned;
+    }
+
+    /**
+     * 列名参数全部小写（形如 id, code...）
+     */
+    private String parseAndJoinCols(String cols) {
+        if (cols == null) return "";
+        String[] arr = cols.split(",");
+        List<String> result = new ArrayList<>();
+        for (String c : arr) {
+            result.add(cleanIdentifier(c.trim()));
+        }
+        return String.join(", ", result);
+    }
+
+    /**
+     * 辅助方法：提取约束中的列名
+     */
+    private List<String> extractColumnNamesFromConstraint(String constraintStr) {
+        List<String> columns = new ArrayList<>();
+        Pattern pattern = Pattern.compile("\\(([^)]+)\\)");
+        Matcher matcher = pattern.matcher(constraintStr);
+        if (matcher.find()) {
+            String cols = matcher.group(1);
+            String[] colArray = cols.split(",");
+            for (String col : colArray) {
+                String cleanCol = col.replaceAll("[\"`']", "").trim().toLowerCase(Locale.ROOT);
+                if (!cleanCol.isEmpty()) {
+                    columns.add(cleanCol);
+                }
+            }
+        }
+        return columns;
+    }
+
     private String convertDataType(String oracleType, List<String> args) {
         if (oracleType == null) return "VARCHAR(255)";
         String type = oracleType.toUpperCase(Locale.ROOT);
         switch (type) {
             case "NUMBER":
                 if (args != null && args.size() == 2) {
+                    // 处理 NUMBER(p,0) 的情况
+                    try {
+                        int scale = Integer.parseInt(args.get(1).trim());
+                        if (scale == 0) {
+                            // NUMBER(p,0) 根据精度转换为 INT 或 BIGINT
+                            int precision = Integer.parseInt(args.get(0).trim());
+                            if (precision <= 10) {
+                                return "INT";
+                            } else {
+                                return "BIGINT";
+                            }
+                        } else {
+                            // NUMBER(p,s) 其中 s != 0，转为 DECIMAL
                     return "DECIMAL(" + args.get(0) + "," + args.get(1) + ")";
+                        }
+                    } catch (NumberFormatException e) {
+                        // 解析失败，回退为 DECIMAL
+                        return "DECIMAL(" + args.get(0) + "," + args.get(1) + ")";
+                    }
                 } else if (args != null && args.size() == 1) {
                     int precision = Integer.parseInt(args.get(0));
                     if (precision <= 10) {
@@ -138,6 +261,26 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                 }
                 return type;
         }
+    }
+
+    @Override
+    public void visit(Drop drop) {
+        // 只关心 DROP TABLE，其它类型直接输出
+        String type = drop.getType();
+        if (type == null || !"TABLE".equalsIgnoreCase(type)) {
+            addRawSql(drop.toString() + ";\n\n");
+            return;
+        }
+
+        String tableName;
+        if (drop.getName() != null) {
+            tableName = cleanIdentifier(drop.getName().getName());
+        } else {
+            tableName = drop.toString().replaceAll("(?i)DROP\\s+TABLE\\s?", "").trim();
+            tableName = cleanIdentifier(tableName);
+        }
+
+        addRawSql("DROP TABLE IF EXISTS "+tableName+";\n\n");
     }
 
     @Override
@@ -264,13 +407,132 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                 tableInfo.columns.add(colInfo);
             }
         }
+
+         // 处理表级约束，将主键约束应用到相应字段上
+         Set<String> tablePrimaryKeyCols = new LinkedHashSet<>();
+         try {
+             Method getIndexesMethod = CreateTable.class.getMethod("getIndexes");
+             List<?> indexes = (List<?>) getIndexesMethod.invoke(createTable);
+             if (indexes != null) {
+                 for (Object idx : indexes) {
+                     String idxStr = idx.toString().trim();
+                     String idxStrUpper = idxStr.toUpperCase(Locale.ROOT);
+                     if (idxStrUpper.contains("PRIMARY KEY")) {
+                         List<String> pkCols = extractColumnNamesFromConstraint(idxStr);
+                         if (pkCols != null && !pkCols.isEmpty()) {
+                             tablePrimaryKeyCols.addAll(pkCols);
+                             // 将表级主键约束应用到相应字段上
+                             for (String pkCol : pkCols) {
+                                 String cleanPkCol = pkCol.replaceAll("[\"`']", "").toLowerCase(Locale.ROOT);
+                                 // 找到对应的字段并标记为主键
+                                 for (ColumnInfo col : tableInfo.columns) {
+                                     String cleanColName = col.name.replaceAll("[\"`']", "").toLowerCase(Locale.ROOT);
+                                     if (cleanColName.equals(cleanPkCol)) {
+                                         col.isPrimaryKey = true;
+                                         // 添加到主键列表中（如果还没有）
+                                         if (!tableInfo.primaryKeys.contains(col.name)) {
+                                             tableInfo.primaryKeys.add(col.name);
+                                         }
+                                         break;
+                                     }
+                                 }
+                             }
+                         }
+                     }
+                 }
+             }
+         } catch (Exception ignore) {}
+
+         // 如果列级主键存在，也加入到集合中
+         for (String pkCol : tableInfo.primaryKeys) {
+             String cleanPkCol = pkCol.replaceAll("[\"`']", "").toLowerCase(Locale.ROOT);
+             tablePrimaryKeyCols.add(cleanPkCol);
+         }
+
+         // 存储到 tablePkColsMap 中（用于索引去重）
+         if (!tablePrimaryKeyCols.isEmpty()) {
+             Set<String> pkSet = new LinkedHashSet<>(tablePrimaryKeyCols);
+             String normTableKey = tableName.replaceAll("[\"`']", "").toLowerCase(Locale.ROOT);
+             tablePkColsMap.put(normTableKey, pkSet);
+         }
+
+         // 将 CREATE TABLE 添加到 chunks 中（延迟渲染）
+         chunks.add(new Chunk(createTable));
     }
 
     @Override
     public void visit(Comment comment) {
-        // 1. 获取注释内容
-        String commentText = null;
+        String commentStr = comment.toString();
 
+        // 处理表注释
+        Pattern tablePattern = Pattern.compile(
+                "^\\s*COMMENT\\s+ON\\s+TABLE\\s+([^\\s]+)\\s+IS\\s+(['\"])(.*?)\\2",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Matcher tableMatcher = tablePattern.matcher(commentStr);
+        if (tableMatcher.find()) {
+            String table = tableMatcher.group(1);
+            String commentTxt = tableMatcher.group(3);
+
+            // 获取表名（去掉schema）
+            String tableName = getTableNameOnly(table);
+
+            // 存储到Map中，等待CREATE TABLE时使用
+            tableComments.put(tableName, commentTxt);
+
+            // 同时更新 TableInfo（如果已存在）
+            TableInfo tableInfo = tables.get(tableName);
+            if (tableInfo != null) {
+                tableInfo.tableComment = commentTxt;
+            }
+
+            return;
+        }
+
+        // 处理列注释
+        Pattern colPattern = Pattern.compile(
+                "^\\s*COMMENT\\s+ON\\s+COLUMN\\s+([^\\s]+)\\s+IS\\s+(['\"])(.*?)\\2",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+        Matcher colMatcher = colPattern.matcher(commentStr);
+        if (colMatcher.find()) {
+            String column = colMatcher.group(1);
+            String commentTxt = colMatcher.group(3);
+
+            // 解析表名和列名
+            String[] parts = column.split("\\.");
+            if (parts.length >= 2) {
+                String tableName, columnName;
+                if (parts.length == 2) {
+                    // table.column 格式
+                    tableName = parts[0];
+                    columnName = parts[1];
+                } else {
+                    // schema.table.column 格式
+                    tableName = parts[1];
+                    columnName = parts[2];
+                }
+
+                // 清理名称
+                tableName = getTableNameOnly(tableName);
+                columnName = columnName.replaceAll("[\"`']", "").toLowerCase(Locale.ROOT).trim();
+
+                // 存储到Map中，等待CREATE TABLE时使用
+                String commentKey = tableName + "." + columnName;
+                columnComments.put(commentKey, commentTxt);
+
+                // 同时更新 ColumnInfo（如果已存在）
+                TableInfo tableInfo = tables.get(tableName);
+                if (tableInfo != null) {
+                    ColumnInfo colInfo = tableInfo.getColumnInfo(columnName);
+                    if (colInfo != null) {
+                        colInfo.columnComment = commentTxt;
+                    }
+                }
+            }
+            return;
+        }
+
+        // 如果正则解析失败，尝试使用JSqlParser API作为fallback
+        String commentText = null;
         if (comment.getComment() instanceof StringValue) {
             StringValue stringValue = (StringValue) comment.getComment();
             commentText = stringValue.getValue().trim();
@@ -284,7 +546,7 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
             TableInfo tableInfo = tables.computeIfAbsent(tableName, k -> new TableInfo());
             tableInfo.tableName = tableName;
 
-            // 2. 字段注释
+            // 字段注释
             if (comment.getColumn() != null) {
                 String columnName = cleanIdentifier(comment.getColumn().getColumnName());
                 ColumnInfo colInfo = tableInfo.getColumnInfo(columnName);
@@ -295,88 +557,348 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                     tableInfo.columns.add(colInfo);
                 }
                 colInfo.columnComment = commentText;
-                System.out.println("字段注解："+colInfo.columnComment);
+                // 同时存储到Map中
+                String commentKey = tableName + "." + columnName;
+                columnComments.put(commentKey, commentText);
             } else {
-                // 3. 表注释
+                // 表注释
                 tableInfo.tableComment = commentText;
+                tableComments.put(tableName, commentText);
             }
+        }
+    }
+
+    @Override
+    public void visit(CreateIndex createIndex) {
+        String indexName;
+        try {
+            indexName = cleanIdentifierNoSchema(createIndex.getIndex().getName());
+        } catch (Exception e) {
+            indexName = cleanIdentifierNoSchema(createIndex.getIndex().getName());
+        }
+
+        String tableName;
+        try {
+            Table table = createIndex.getTable();
+            if (table != null && table.getSchemaName() != null && !table.getSchemaName().isEmpty()) {
+                tableName = cleanIdentifier(table.getSchemaName()) + "." + cleanIdentifier(table.getName());
+            } else {
+                tableName = cleanIdentifier(createIndex.getTable().getName());
+            }
+        } catch (Exception e) {
+            tableName = cleanIdentifier(createIndex.getTable().getName());
+        }
+
+        boolean isUnique = false;
+        try {
+            Method isUniqueMethod = createIndex.getClass().getMethod("isUnique");
+            Object result = isUniqueMethod.invoke(createIndex);
+            if (result instanceof Boolean) isUnique = (Boolean) result;
+        } catch (Exception e) {
+            String text = createIndex.toString().toUpperCase(Locale.ROOT);
+            if (text.contains("UNIQUE") || (indexName != null && indexName.toUpperCase(Locale.ROOT).contains("UNIQUE"))) {
+                isUnique = true;
+            }
+        }
+
+        List<String> columns = extractIndexColumns(createIndex);
+
+        // 如果是唯一索引且列集合与表主键一致，跳过创建（避免重复）
+        String normTableKey = tableName.replaceAll("[\"`']", "").toLowerCase(Locale.ROOT);
+        Set<String> pkCols = tablePkColsMap.get(normTableKey);
+        if (isUnique && pkCols != null && !pkCols.isEmpty()) {
+            Set<String> idxCols = new LinkedHashSet<>();
+            for (String c : columns) {
+                idxCols.add(c.replaceAll("[\"`']", "").toLowerCase(Locale.ROOT));
+            }
+            if (pkCols.equals(idxCols)) {
+                return;
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("CREATE");
+        if (isUnique) sb.append(" UNIQUE");
+        sb.append(" INDEX `").append(indexName).append("`")
+                .append(" ON ").append(tableName)
+                .append(" (").append(String.join(", ", columns)).append(");\n\n");
+        addRawSql(sb.toString());
+    }
+
+    /**
+     * 辅助方法：提取索引列
+     */
+    private List<String> extractIndexColumns(CreateIndex createIndex) {
+        List<String> columns = new ArrayList<>();
+        try {
+            Method getColumnsMethod = CreateIndex.class.getMethod("getColumns");
+            List<?> colsObj = (List<?>) getColumnsMethod.invoke(createIndex);
+            if (colsObj != null) {
+                for (Object col : colsObj) {
+                    if (col instanceof Column) {
+                        columns.add(cleanIdentifier(((Column) col).getColumnName()));
+                    } else if (col instanceof String) {
+                        columns.add(cleanIdentifier((String) col));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            String idxStr = createIndex.toString();
+            int lpar = idxStr.indexOf('(');
+            int rpar = idxStr.indexOf(')', lpar);
+            if (lpar != -1 && rpar != -1) {
+                String inParens = idxStr.substring(lpar + 1, rpar);
+                String[] colArr = inParens.split(",");
+                for (String raw : colArr) {
+                    columns.add(cleanIdentifier(raw.trim()));
+                }
+            }
+        }
+        return columns;
+    }
+
+    @Override
+    public void visit(Alter alter) {
+        String tableName = null;
+        try {
+            Method getTableMethod = Alter.class.getMethod("getTable");
+            Object tblObj = getTableMethod.invoke(alter);
+            if (tblObj != null && tblObj.getClass().getMethod("getName") != null) {
+                Table tableObj = (Table)tblObj;
+                if (tableObj.getSchemaName() != null && !tableObj.getSchemaName().isEmpty()) {
+                    tableName = cleanIdentifier(tableObj.getSchemaName()) + "." + cleanIdentifier(tableObj.getName());
+                } else {
+                    tableName = cleanIdentifier(tableObj.getName());
+                }
+            }
+        } catch (Exception e) {
+            String alterStr = alter.toString();
+            Pattern p = Pattern.compile("ALTER TABLE\\s+((\"[^\"]+\"\\.)?\"[^\"]+\")", Pattern.CASE_INSENSITIVE);
+            Matcher m = p.matcher(alterStr);
+            if (m.find()) {
+                String t = m.group(1);
+                t = t.replaceAll("^[`'\"]+|[`'\"]+$", "");
+                tableName = cleanIdentifier(t);
+            }
+            if (tableName == null) {
+                Pattern p2 = Pattern.compile("ALTER TABLE\\s+([\\w\\[\\]]+)", Pattern.CASE_INSENSITIVE);
+                Matcher m2 = p2.matcher(alterStr);
+                if (m2.find()) {
+                    tableName = cleanIdentifier(m2.group(1));
+                }
+            }
+        }
+        if (tableName == null) {
+            tableName = "unknown_table";
+        }
+        List<AlterExpression> expressions = null;
+        try {
+            Method getAlterExprMethod = Alter.class.getMethod("getAlterExpressions");
+            Object alterExprsObj = getAlterExprMethod.invoke(alter);
+            if (alterExprsObj instanceof List) {
+                @SuppressWarnings("unchecked")
+                List<AlterExpression> alterExprs = (List<AlterExpression>) alterExprsObj;
+                expressions = alterExprs;
+            }
+        } catch (Exception e) {}
+        if (expressions != null) {
+            for (AlterExpression expr : expressions) {
+                if (expr == null) continue;
+                String opStr = expr.getOperation() != null ? expr.getOperation().toString().toUpperCase(Locale.ROOT) : "";
+                if ("ADD".equals(opStr) && expr.getIndex() != null) {
+                    Object idx = expr.getIndex();
+                    String idxStr = idx.toString();
+                    StringBuilder sb = new StringBuilder();
+                    Pattern pkPattern = Pattern.compile(
+                            "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
+                            Pattern.CASE_INSENSITIVE);
+                    Matcher pkMatcher = pkPattern.matcher(idxStr);
+                    if (pkMatcher.find()) {
+                        String pkName = pkMatcher.group(1) == null ? "" : pkMatcher.group(1);
+                        String cols = pkMatcher.group(2);
+                        sb.append("ALTER TABLE ").append(tableName)
+                                .append(" ADD CONSTRAINT ");
+                        if (pkName != null && !pkName.isEmpty()) {
+                            sb.append(cleanIdentifier(pkName)).append(" ");
+                        }
+                        sb.append("PRIMARY KEY (")
+                                .append(parseAndJoinCols(cols))
+                                .append(");\n\n");
+                        addRawSql(sb.toString());
+                        continue;
+                    }
+                    Pattern uqPattern = Pattern.compile(
+                            "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*UNIQUE\\s*\\(([^)]+)\\)",
+                            Pattern.CASE_INSENSITIVE);
+                    Matcher uqMatcher = uqPattern.matcher(idxStr);
+                    if (uqMatcher.find()) {
+                        String uqName = uqMatcher.group(1) == null ? "" : uqMatcher.group(1);
+                        String cols = uqMatcher.group(2);
+                        sb.append("ALTER TABLE ").append(tableName)
+                                .append(" ADD CONSTRAINT ");
+                        if (uqName != null && !uqName.isEmpty()) {
+                            sb.append(cleanIdentifier(uqName)).append(" ");
+                        }
+                        sb.append("UNIQUE (")
+                                .append(parseAndJoinCols(cols))
+                                .append(");\n\n");
+                        addRawSql(sb.toString());
+                        continue;
+                    }
+                    Pattern fkPattern = Pattern.compile(
+                            "CONSTRAINT\\s+([`'\"][^`'\"]+[`'\"]|[\\w_]+)?\\s*FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
+                            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+                    Matcher fkMatcher = fkPattern.matcher(idxStr);
+                    if (fkMatcher.find()) {
+                        String fkName = fkMatcher.group(1) == null ? "" : fkMatcher.group(1);
+                        String localCols = fkMatcher.group(2);
+                        String refTable = fkMatcher.group(3);
+                        String refCols = fkMatcher.group(4);
+                        sb.append("ALTER TABLE ").append(tableName)
+                                .append(" ADD CONSTRAINT ");
+                        if (fkName != null && !fkName.trim().isEmpty()) {
+                            sb.append(cleanIdentifier(fkName.trim())).append(" ");
+                        }
+                        sb.append("FOREIGN KEY (")
+                                .append(parseAndJoinCols(localCols))
+                                .append(") REFERENCES ")
+                                .append(cleanIdentifier(getTableNameOnly(refTable)))
+                                .append(" (")
+                                .append(parseAndJoinCols(refCols))
+                                .append(");\n\n");
+                        addRawSql(sb.toString());
+                        continue;
+                    }
+                    Pattern checkPattern = Pattern.compile(
+                            "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*CHECK\\s*\\((.+)\\)", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+                    Matcher checkMatcher = checkPattern.matcher(idxStr);
+                    if (checkMatcher.find()) {
+                        String checkName = checkMatcher.group(1) == null ? "" : checkMatcher.group(1);
+                        String checkExpr = checkMatcher.group(2).trim();
+                        sb.append("ALTER TABLE ").append(tableName)
+                                .append(" ADD CONSTRAINT ");
+                        if (checkName != null && !checkName.isEmpty()) {
+                            sb.append(cleanIdentifier(checkName)).append(" ");
+                        }
+                        sb.append("CHECK (").append(checkExpr).append(");\n\n");
+                        addRawSql(sb.toString());
+                        continue;
+                    }
+                }
+            }
+        } else {
+            String s = alter.toString();
+            addRawSql(s + ";\n\n");
         }
     }
 
     @Override
     public void visit(Insert insert) {
-        otherStatements.add(convertInsert(insert));
+        String sql = convertInsert(insert);
+        addRawSql(sql);
     }
 
     @Override
     public void visit(Update update) {
-        otherStatements.add(convertUpdate(update));
+        String sql = convertUpdate(update);
+        addRawSql(sql);
     }
 
     @Override
     public void visit(Delete delete) {
-        otherStatements.add(convertDelete(delete));
+        String sql = convertDelete(delete);
+        addRawSql(sql);
     }
 
-    private void generateTableDefinitions() {
-        // 生成所有表的定义
-        for (TableInfo tableInfo : tables.values()) {
-            if (!tableInfo.hasTableDefinition) {
-                continue; // 如果没有表定义，只有注释，不生成CREATE TABLE
-            }
+    private String renderCreateTable(CreateTable createTable) {
+        StringBuilder sb = new StringBuilder();
+        // 如果存在 schema，则保留 schema.table
+        String tableName = getFullTableName(createTable.getTable());
+        TableInfo tableInfo = tables.get(tableName);
+        if (tableInfo == null || !tableInfo.hasTableDefinition) {
+            return "";
+        }
 
-            mysqlSql.append("CREATE TABLE IF NOT EXISTS ").append(tableInfo.tableName).append(" (\n");
+        sb.append("CREATE TABLE ").append(tableInfo.tableName).append(" (\n");
+
+        // 判断是否是单字段主键
+        boolean isSingleColumnPrimaryKey = tableInfo.primaryKeys.size() == 1;
 
             for (int i = 0; i < tableInfo.columns.size(); i++) {
                 ColumnInfo col = tableInfo.columns.get(i);
-                if (i > 0) mysqlSql.append(",\n");
+            if (i > 0) sb.append(",\n");
 
-                mysqlSql.append("    ").append(col.name).append(" ").append(col.type);
+            sb.append("    ").append(col.name).append(" ").append(col.type);
 
                 if (col.defaultValue != null) {
-                    mysqlSql.append(" DEFAULT ").append(col.defaultValue);
+                sb.append(" DEFAULT ").append(col.defaultValue);
                 }
 
                 if (col.isAutoIncrement) {
-                    mysqlSql.append(" AUTO_INCREMENT");
+                sb.append(" AUTO_INCREMENT");
                 }
 
-                if(col.isPrimaryKey){
-                    mysqlSql.append(" PRIMARY KEY ");
+            // 只有单字段主键时，才在字段后面加 PRIMARY KEY
+            if(col.isPrimaryKey && isSingleColumnPrimaryKey){
+                sb.append(" PRIMARY KEY");
                 }
 
                 if (col.isNotNull) {
-                    mysqlSql.append(" NOT NULL");
+                sb.append(" NOT NULL");
                 }
 
                 if (col.isUnique) {
-                    mysqlSql.append(" UNIQUE");
+                sb.append(" UNIQUE");
                 }
 
                 if (col.checkConstraint != null && !col.checkConstraint.isEmpty()) {
-                    mysqlSql.append(" CHECK ").append(col.checkConstraint);
-                }
-
-                // 修复：始终添加字段注释（如果有）
-                if (col.columnComment != null && !col.columnComment.isEmpty()) {
-                    mysqlSql.append(" COMMENT '").append(escapeComment(col.columnComment)).append("'");
-                }
+                sb.append(" CHECK ").append(col.checkConstraint);
             }
 
-            mysqlSql.append("\n)");
-
-            // 添加表注释
-            if (tableInfo.tableComment != null && !tableInfo.tableComment.isEmpty()) {
-                mysqlSql.append(" COMMENT='").append(escapeComment(tableInfo.tableComment)).append("'");
+            // 优先使用Map中的注释（从COMMENT ON COLUMN语句解析的），否则使用ColumnInfo中的注释
+            String columnCommentKey = tableInfo.tableName + "." + col.name;
+            String columnComment = columnComments.get(columnCommentKey);
+            if (columnComment == null || columnComment.isEmpty()) {
+                columnComment = col.columnComment;
             }
-
-            mysqlSql.append(";\n\n");
+            if (columnComment != null && !columnComment.isEmpty()) {
+                // 移除注释值中的引号（如果存在）
+                if ((columnComment.startsWith("'") && columnComment.endsWith("'")) ||
+                        (columnComment.startsWith("\"") && columnComment.endsWith("\""))) {
+                    columnComment = columnComment.substring(1, columnComment.length() - 1);
+                }
+                sb.append(" COMMENT '").append(escapeComment(columnComment)).append("'");
+            }
         }
 
-        // 输出其他语句（INSERT, UPDATE, DELETE）
-        for (String stmt : otherStatements) {
-            mysqlSql.append(stmt);
+        // 如果是复合主键，在最后添加 PRIMARY KEY 约束
+        if (!tableInfo.primaryKeys.isEmpty() && !isSingleColumnPrimaryKey) {
+            sb.append(",\n    PRIMARY KEY (");
+            for (int i = 0; i < tableInfo.primaryKeys.size(); i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(tableInfo.primaryKeys.get(i));
+            }
+            sb.append(")");
         }
+
+        sb.append("\n)");
+
+        // 优先使用Map中的表注释（从COMMENT ON TABLE语句解析的），否则使用TableInfo中的注释
+        String tableComment = tableComments.get(tableInfo.tableName);
+        if (tableComment == null || tableComment.isEmpty()) {
+            tableComment = tableInfo.tableComment;
+        }
+        if (tableComment != null && !tableComment.isEmpty()) {
+            // 移除注释值中的引号（如果存在）
+            if ((tableComment.startsWith("'") && tableComment.endsWith("'")) ||
+                    (tableComment.startsWith("\"") && tableComment.endsWith("\""))) {
+                tableComment = tableComment.substring(1, tableComment.length() - 1);
+            }
+            sb.append(" COMMENT='").append(escapeComment(tableComment)).append("'");
+        }
+
+        sb.append(";\n\n");
+        return sb.toString();
     }
 
     private String convertInsert(Insert insert) {
@@ -720,16 +1242,25 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
     }
 
     public String getMysqlSql() {
-        // 在获取最终SQL时，生成所有表的定义
-        if (mysqlSql.length() == 0) {
-            generateTableDefinitions();
+        // 按照chunks的顺序输出，保持原始语句顺序
+        StringBuilder result = new StringBuilder();
+        for (Chunk c : chunks) {
+            if (c.type == ChunkType.CREATE_TABLE) {
+                result.append(renderCreateTable(c.createTable));
+            } else if (c.rawSql != null) {
+                result.append(c.rawSql);
+            }
         }
-        return mysqlSql.toString();
+        return result.toString();
     }
 
     public void clear() {
         mysqlSql.setLength(0);
+        chunks.clear();
         tables.clear();
         otherStatements.clear();
+        columnComments.clear();
+        tableComments.clear();
+        tablePkColsMap.clear();
     }
 }

@@ -8,8 +8,11 @@ import net.sf.jsqlparser.statement.drop.Drop;
 import net.sf.jsqlparser.statement.insert.Insert;
 import net.sf.jsqlparser.statement.delete.Delete;
 import net.sf.jsqlparser.statement.update.Update;
+import net.sf.jsqlparser.statement.alter.Alter;
+import net.sf.jsqlparser.statement.alter.AlterExpression;
 import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.schema.Column;
+import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.StatementVisitorAdapter;
 import net.sf.jsqlparser.statement.create.table.Index;
 
@@ -1218,15 +1221,48 @@ public class MysqlToOBVisitor extends StatementVisitorAdapter {
         return tokens;
     }
 
+    // 辅助方法：解析并连接列名
+    private String parseAndJoinCols(String cols) {
+        if (cols == null) return "";
+        String[] arr = cols.split(",");
+        List<String> result = new ArrayList<>();
+        for (String c : arr) {
+            result.add(cleanIdentifier(c.trim()));
+        }
+        return String.join(", ", result);
+    }
+
     /**
      * 增强：CreateIndex 转换为 OceanBase 索引语法（全局/本地索引）
      */
     @Override
     public void visit(CreateIndex createIndex) {
         String indexName = cleanIdentifier(createIndex.getIndex().getName());
-        String tableName = cleanIdentifier(createIndex.getTable().getName());
-        boolean isUnique = createIndex.toString().toUpperCase().contains("UNIQUE") ||
-                (indexName != null && indexName.toUpperCase().startsWith("UNIQUE_"));
+        String tableName;
+        try {
+            Table table = createIndex.getTable();
+            if (table != null && table.getSchemaName() != null && !table.getSchemaName().isEmpty()) {
+                tableName = cleanIdentifier(table.getSchemaName()) + "." + cleanIdentifier(table.getName());
+            } else {
+                tableName = cleanIdentifier(createIndex.getTable().getName());
+            }
+        } catch (Exception e) {
+            tableName = cleanIdentifier(createIndex.getTable().getName());
+        }
+
+        boolean isUnique = false;
+        try {
+            Method isUniqueMethod = createIndex.getClass().getMethod("isUnique");
+            Object result = isUniqueMethod.invoke(createIndex);
+            if (result instanceof Boolean) {
+                isUnique = (Boolean) result;
+            }
+        } catch (Exception e) {
+            String text = createIndex.toString().toUpperCase();
+            if (text.contains("UNIQUE") || (indexName != null && indexName.toUpperCase().contains("UNIQUE"))) {
+                isUnique = true;
+            }
+        }
 
         List<String> columns = new ArrayList<>();
         List<?> colsObj = null;
@@ -1283,6 +1319,278 @@ public class MysqlToOBVisitor extends StatementVisitorAdapter {
         }
 
         oceanBaseSql.append(";\n\n");
+    }
+
+    @Override
+    public void visit(Alter alter) {
+        String tableName = null;
+        String alterStr = alter.toString();
+        try {
+            Method getTableMethod = Alter.class.getMethod("getTable");
+            Object tblObj = getTableMethod.invoke(alter);
+            if (tblObj != null && tblObj.getClass().getMethod("getName") != null) {
+                Table tableObj = (Table)tblObj;
+                if (tableObj.getSchemaName() != null && !tableObj.getSchemaName().isEmpty()) {
+                    tableName = cleanIdentifier(tableObj.getSchemaName()) + "." + cleanIdentifier(tableObj.getName());
+                } else {
+                    tableName = cleanIdentifier(tableObj.getName());
+                }
+            }
+        } catch (Exception e) {
+            Pattern p = Pattern.compile("ALTER TABLE\\s+((\"[^\"]+\"\\.)?\"[^\"]+\"|`[^`]+`|[\\w]+)", Pattern.CASE_INSENSITIVE);
+            Matcher m = p.matcher(alterStr);
+            if (m.find()) {
+                String t = m.group(1);
+                t = t.replaceAll("[`'\"]+", "");
+                tableName = cleanIdentifier(t);
+            }
+            if (tableName == null) {
+                Pattern p2 = Pattern.compile("ALTER TABLE\\s+([\\w\\[\\]]+)", Pattern.CASE_INSENSITIVE);
+                Matcher m2 = p2.matcher(alterStr);
+                if (m2.find()) {
+                    tableName = cleanIdentifier(m2.group(1));
+                }
+            }
+        }
+        if (tableName == null) {
+            tableName = "UNKNOWN_TABLE";
+        }
+        
+        // 先尝试从 AlterExpression 解析
+        List<AlterExpression> expressions = null;
+        try {
+            Method getAlterExprMethod = Alter.class.getMethod("getAlterExpressions");
+            Object alterExprsObj = getAlterExprMethod.invoke(alter);
+            if (alterExprsObj instanceof List) {
+                @SuppressWarnings("unchecked")
+                List<AlterExpression> alterExprs = (List<AlterExpression>) alterExprsObj;
+                expressions = alterExprs;
+            }
+        } catch (Exception e) {}
+        
+        if (expressions != null) {
+            for (AlterExpression expr : expressions) {
+                if (expr == null) continue;
+                String opStr = expr.getOperation() != null ? expr.getOperation().toString().toUpperCase() : "";
+                if ("ADD".equals(opStr) && expr.getIndex() != null) {
+                    Object idx = expr.getIndex();
+                    String idxStr = idx.toString();
+                    StringBuilder sb = new StringBuilder();
+                    
+                    Pattern pkPattern = Pattern.compile(
+                            "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
+                            Pattern.CASE_INSENSITIVE);
+                    Matcher pkMatcher = pkPattern.matcher(idxStr);
+                    if (pkMatcher.find()) {
+                        String pkName = pkMatcher.group(1) == null ? "" : pkMatcher.group(1);
+                        String cols = pkMatcher.group(2);
+                        sb.append("ALTER TABLE ").append(tableName)
+                                .append(" ADD CONSTRAINT ");
+                        if (pkName != null && !pkName.isEmpty()) {
+                            sb.append(cleanIdentifier(pkName)).append(" ");
+                        }
+                        sb.append("PRIMARY KEY (")
+                                .append(parseAndJoinCols(cols))
+                                .append(");\n\n");
+                        oceanBaseSql.append(sb.toString());
+                        continue;
+                    }
+                    
+                    Pattern uqPattern = Pattern.compile(
+                            "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*UNIQUE\\s*\\(([^)]+)\\)",
+                            Pattern.CASE_INSENSITIVE);
+                    Matcher uqMatcher = uqPattern.matcher(idxStr);
+                    if (uqMatcher.find()) {
+                        String uqName = uqMatcher.group(1) == null ? "" : uqMatcher.group(1);
+                        String cols = uqMatcher.group(2);
+                        sb.append("ALTER TABLE ").append(tableName)
+                                .append(" ADD CONSTRAINT ");
+                        if (uqName != null && !uqName.isEmpty()) {
+                            sb.append(cleanIdentifier(uqName)).append(" ");
+                        }
+                        sb.append("UNIQUE (")
+                                .append(parseAndJoinCols(cols))
+                                .append(");\n\n");
+                        oceanBaseSql.append(sb.toString());
+                        continue;
+                    }
+                    
+                    Pattern fkPattern = Pattern.compile(
+                            "CONSTRAINT\\s+([`'\"][^`'\"]+[`'\"]|[\\w_]+)?\\s*FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
+                            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+                    Matcher fkMatcher = fkPattern.matcher(idxStr);
+                    if (fkMatcher.find()) {
+                        String fkName = fkMatcher.group(1) == null ? "" : fkMatcher.group(1);
+                        String localCols = fkMatcher.group(2);
+                        String refTable = fkMatcher.group(3);
+                        String refCols = fkMatcher.group(4);
+                        sb.append("ALTER TABLE ").append(tableName)
+                                .append(" ADD CONSTRAINT ");
+                        if (fkName != null && !fkName.trim().isEmpty()) {
+                            sb.append(cleanIdentifier(fkName.trim())).append(" ");
+                        }
+                        sb.append("FOREIGN KEY (")
+                                .append(parseAndJoinCols(localCols))
+                                .append(") REFERENCES ")
+                                .append(cleanIdentifier(refTable.replaceAll("[`'\"]", "")))
+                                .append(" (")
+                                .append(parseAndJoinCols(refCols))
+                                .append(");\n\n");
+                        oceanBaseSql.append(sb.toString());
+                        continue;
+                    }
+                    
+                    Pattern checkPattern = Pattern.compile(
+                            "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*CHECK\\s*\\((.+)\\)", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+                    Matcher checkMatcher = checkPattern.matcher(idxStr);
+                    if (checkMatcher.find()) {
+                        String checkName = checkMatcher.group(1) == null ? "" : checkMatcher.group(1);
+                        String checkExpr = checkMatcher.group(2).trim();
+                        sb.append("ALTER TABLE ").append(tableName)
+                                .append(" ADD CONSTRAINT ");
+                        if (checkName != null && !checkName.isEmpty()) {
+                            sb.append(cleanIdentifier(checkName)).append(" ");
+                        }
+                        sb.append("CHECK (").append(checkExpr).append(");\n\n");
+                        oceanBaseSql.append(sb.toString());
+                        continue;
+                    }
+                }
+            }
+        } else {
+            String s = alter.toString();
+            oceanBaseSql.append(s).append(";\n\n");
+        }
+        
+        // 如果 AlterExpression 解析失败，尝试直接从 alter.toString() 解析
+        if (expressions == null || expressions.isEmpty()) {
+            String alterStrUpper = alterStr.toUpperCase();
+            
+            // 解析 ADD CONSTRAINT PRIMARY KEY
+            Pattern pkPattern = Pattern.compile(
+                    "ADD\\s+CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher pkMatcher = pkPattern.matcher(alterStr);
+            if (pkMatcher.find()) {
+                String pkName = pkMatcher.group(1);
+                String cols = pkMatcher.group(2);
+                StringBuilder sb = new StringBuilder();
+                sb.append("ALTER TABLE ").append(tableName)
+                        .append(" ADD CONSTRAINT ");
+                if (pkName != null && !pkName.trim().isEmpty()) {
+                    sb.append(cleanIdentifier(pkName)).append(" ");
+                }
+                sb.append("PRIMARY KEY (")
+                        .append(parseAndJoinCols(cols))
+                        .append(");\n\n");
+                oceanBaseSql.append(sb.toString());
+                return;
+            }
+            
+            // 解析 ADD CONSTRAINT UNIQUE
+            Pattern uqPattern = Pattern.compile(
+                    "ADD\\s+CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*UNIQUE\\s*\\(([^)]+)\\)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher uqMatcher = uqPattern.matcher(alterStr);
+            if (uqMatcher.find()) {
+                String uqName = uqMatcher.group(1);
+                String cols = uqMatcher.group(2);
+                StringBuilder sb = new StringBuilder();
+                sb.append("ALTER TABLE ").append(tableName)
+                        .append(" ADD CONSTRAINT ");
+                if (uqName != null && !uqName.trim().isEmpty()) {
+                    sb.append(cleanIdentifier(uqName)).append(" ");
+                }
+                sb.append("UNIQUE (")
+                        .append(parseAndJoinCols(cols))
+                        .append(");\n\n");
+                oceanBaseSql.append(sb.toString());
+                return;
+            }
+            
+            // 解析 ADD INDEX
+            Pattern indexPattern = Pattern.compile(
+                    "ADD\\s+(UNIQUE\\s+)?INDEX\\s+([`'\"]?\\w+[`'\"]?)\\s*\\(([^)]+)\\)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher indexMatcher = indexPattern.matcher(alterStr);
+            if (indexMatcher.find()) {
+                boolean isUnique = indexMatcher.group(1) != null;
+                String idxName = cleanIdentifier(indexMatcher.group(2));
+                String cols = indexMatcher.group(3);
+                List<String> columns = new ArrayList<>();
+                String[] colArr = cols.split(",");
+                for (String col : colArr) {
+                    columns.add(cleanIdentifier(col.trim()));
+                }
+                
+                // 获取 OceanBase 索引类型
+                OBIndexType idxType = getIndexType(tableName, columns);
+                
+                StringBuilder sb = new StringBuilder();
+                sb.append("CREATE");
+                if (isUnique) sb.append(" UNIQUE");
+                sb.append(" INDEX ").append(idxName);
+                if (idxType == OBIndexType.GLOBAL) {
+                    sb.append(" GLOBAL");
+                } else if (idxType == OBIndexType.LOCAL) {
+                    sb.append(" LOCAL");
+                }
+                sb.append(" ON ").append(tableName)
+                        .append(" (").append(String.join(", ", columns))
+                        .append(") USING BTREE;\n\n");
+                oceanBaseSql.append(sb.toString());
+                return;
+            }
+            
+            // 解析 ADD CONSTRAINT FOREIGN KEY
+            Pattern fkPattern = Pattern.compile(
+                    "ADD\\s+CONSTRAINT\\s+([`'\"][^`'\"]+[`'\"]|[\\w_]+)?\\s*FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
+                    Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+            Matcher fkMatcher = fkPattern.matcher(alterStr);
+            if (fkMatcher.find()) {
+                String fkName = fkMatcher.group(1);
+                String localCols = fkMatcher.group(2);
+                String refTable = fkMatcher.group(3);
+                String refCols = fkMatcher.group(4);
+                StringBuilder sb = new StringBuilder();
+                sb.append("ALTER TABLE ").append(tableName)
+                        .append(" ADD CONSTRAINT ");
+                if (fkName != null && !fkName.trim().isEmpty()) {
+                    sb.append(cleanIdentifier(fkName.trim())).append(" ");
+                }
+                sb.append("FOREIGN KEY (")
+                        .append(parseAndJoinCols(localCols))
+                        .append(") REFERENCES ")
+                        .append(cleanIdentifier(refTable.replaceAll("[`'\"]", "")))
+                        .append(" (")
+                        .append(parseAndJoinCols(refCols))
+                        .append(");\n\n");
+                oceanBaseSql.append(sb.toString());
+                return;
+            }
+            
+            // 解析 ADD CONSTRAINT CHECK
+            Pattern checkPattern = Pattern.compile(
+                    "ADD\\s+CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*CHECK\\s*\\((.+?)\\)",
+                    Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+            Matcher checkMatcher = checkPattern.matcher(alterStr);
+            if (checkMatcher.find()) {
+                String checkName = checkMatcher.group(1);
+                String checkExpr = checkMatcher.group(2).trim();
+                StringBuilder sb = new StringBuilder();
+                sb.append("ALTER TABLE ").append(tableName)
+                        .append(" ADD CONSTRAINT ");
+                if (checkName != null && !checkName.trim().isEmpty()) {
+                    sb.append(cleanIdentifier(checkName)).append(" ");
+                }
+                sb.append("CHECK (").append(checkExpr).append(");\n\n");
+                oceanBaseSql.append(sb.toString());
+                return;
+            }
+        }
+        
+        // 如果都无法解析，直接输出原始语句
+        oceanBaseSql.append(alterStr).append(";\n\n");
     }
 
     @Override
@@ -1368,7 +1676,7 @@ public class MysqlToOBVisitor extends StatementVisitorAdapter {
                 .append("    IF SQLCODE != -942 THEN\n")
                 .append("      RAISE;\n")
                 .append("    END IF;\n")
-                .append("END;\n/\n\n");
+                .append("END;\n\n");
     }
 
     private static class IndexArtifacts {
