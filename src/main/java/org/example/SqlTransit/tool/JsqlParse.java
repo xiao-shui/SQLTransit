@@ -43,6 +43,7 @@ public class JsqlParse {
                     System.err.println("请重新输入文件路径。\n");
                     continue;
                 }
+                sql=OraclePreProcess.preprocess(sql);
 
                 // 解析SQL
                 Statements statements;

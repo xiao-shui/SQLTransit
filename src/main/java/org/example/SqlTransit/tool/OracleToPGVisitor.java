@@ -1,9 +1,17 @@
 package org.example.SqlTransit.tool;
 
 import net.sf.jsqlparser.expression.Expression;
+import net.sf.jsqlparser.expression.Function;
+import net.sf.jsqlparser.expression.StringValue;
+import net.sf.jsqlparser.expression.DoubleValue;
+import net.sf.jsqlparser.expression.DateValue;
+import net.sf.jsqlparser.expression.LongValue;
+import net.sf.jsqlparser.expression.operators.relational.ExpressionList;
 import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.StatementVisitorAdapter;
+import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.alter.Alter;
 import net.sf.jsqlparser.statement.alter.AlterExpression;
 import net.sf.jsqlparser.statement.comment.Comment;
@@ -757,6 +765,11 @@ public class OracleToPGVisitor extends StatementVisitorAdapter {
 
     @Override
     public void visit(Insert insert) {
+        String sql = convertInsert(insert);
+        addRawSql(sql);
+    }
+
+    private String convertInsert(Insert insert) {
         StringBuilder sb = new StringBuilder();
         String tableName = cleanIdentifier(insert.getTable().getName());
         sb.append("INSERT INTO ").append(tableName);
@@ -771,20 +784,40 @@ public class OracleToPGVisitor extends StatementVisitorAdapter {
             sb.append(")");
         }
 
-        String valuesStr = insert.toString();
-        int idx = valuesStr.toUpperCase(Locale.ROOT).indexOf("VALUES");
-        String valuesPart = "";
-        if (idx != -1) {
-            valuesPart = valuesStr.substring(idx + 6);
-            valuesPart = convertOracleFunctions(valuesPart);
+        try {
+            Method getValuesMethod = Insert.class.getMethod("getValues");
+            Object values = getValuesMethod.invoke(insert);
+
+            if (values instanceof ExpressionList) {
+                ExpressionList exprList = (ExpressionList) values;
+                @SuppressWarnings("unchecked")
+                List<Expression> expressions = (List<Expression>) (List<?>) exprList.getExpressions();
+                sb.append(" VALUES (");
+                for (int i = 0; i < expressions.size(); i++) {
+                    Expression expr = expressions.get(i);
+                    sb.append(convertExpression(expr));
+                    if (i < expressions.size() - 1) {
+                        sb.append(", ");
+                    }
+                }
+                sb.append(")");
+            } else if (values != null) {
+                sb.append(" ").append(values.toString());
+            }
+        } catch (Exception e) {
+            sb.append("/* 解析INSERT出错 */");
         }
 
-        sb.append(" VALUES").append(valuesPart).append(";\n\n");
-        addRawSql(sb.toString());
+        return sb.append(";\n\n").toString();
     }
 
     @Override
     public void visit(Update update) {
+        String sql = convertUpdate(update);
+        addRawSql(sql);
+    }
+
+    private String convertUpdate(Update update) {
         StringBuilder sb = new StringBuilder();
         String tableName = cleanIdentifier(update.getTable().getName());
         sb.append("UPDATE ").append(tableName).append(" SET ");
@@ -795,34 +828,183 @@ public class OracleToPGVisitor extends StatementVisitorAdapter {
 
         for (int i = 0; i < cols.size(); i++) {
             String colName = cleanIdentifier(cols.get(i).getColumnName());
-            String valueExpr = exprs.get(i).toString();
-            valueExpr = convertOracleFunctions(valueExpr);
-            sb.append(colName).append(" = ").append(valueExpr);
-            if (i < cols.size() - 1) sb.append(", ");
+            Expression expression = exprs.get(i);
+            sb.append(colName).append(" = ");
+            sb.append(convertExpression(expression));
+            if (i < cols.size() - 1) {
+                sb.append(", ");
+            }
         }
 
         Expression where = update.getWhere();
         if (where != null) {
-            sb.append(" WHERE ").append(convertOracleFunctions(where.toString()));
+            sb.append(" WHERE ").append(convertExpression(where));
         }
 
-        sb.append(";\n\n");
-        addRawSql(sb.toString());
+        return sb.append(";\n\n").toString();
     }
 
     @Override
     public void visit(Delete delete) {
+        String sql = convertDelete(delete);
+        addRawSql(sql);
+    }
+
+    private String convertDelete(Delete delete) {
         StringBuilder sb = new StringBuilder();
         String tableName = cleanIdentifier(delete.getTable().getName());
         sb.append("DELETE FROM ").append(tableName);
 
         Expression where = delete.getWhere();
         if (where != null) {
-            sb.append(" WHERE ").append(convertOracleFunctions(where.toString()));
+            sb.append(" WHERE ").append(convertExpression(where));
         }
 
-        sb.append(";\n\n");
-        addRawSql(sb.toString());
+        return sb.append(";\n\n").toString();
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    public void visit(Select select) {
+        String sql = convertSelect(select);
+        addRawSql(sql);
+    }
+
+    private String convertSelect(Select select) {
+        StringBuilder sb = new StringBuilder();
+        
+        if (select.getSelectBody() instanceof PlainSelect) {
+            PlainSelect plainSelect = (PlainSelect) select.getSelectBody();
+            
+            // 处理 SELECT 列表
+            sb.append("SELECT ");
+            if (plainSelect.getSelectItems() != null) {
+                boolean first = true;
+                for (Object item : plainSelect.getSelectItems()) {
+                    if (!first) sb.append(", ");
+                    String itemStr = item.toString();
+                    itemStr = convertOracleFunctions(itemStr);
+                    sb.append(itemStr);
+                    first = false;
+                }
+            } else {
+                sb.append("*");
+            }
+            
+            // 处理 FROM
+            if (plainSelect.getFromItem() != null) {
+                String fromStr = plainSelect.getFromItem().toString();
+                // 转换表名，保留 schema
+                if (plainSelect.getFromItem() instanceof Table) {
+                    Table table = (Table) plainSelect.getFromItem();
+                    fromStr = getFullTableName(table);
+                } else {
+                    fromStr = convertOracleFunctions(fromStr);
+                }
+                sb.append(" FROM ").append(fromStr);
+            }
+            
+            // 处理 WHERE
+            if (plainSelect.getWhere() != null) {
+                String whereStr = convertExpression(plainSelect.getWhere());
+                sb.append(" WHERE ").append(whereStr);
+            }
+            
+            // 处理 ORDER BY
+            if (plainSelect.getOrderByElements() != null) {
+                sb.append(" ORDER BY ");
+                boolean first = true;
+                for (Object orderElem : plainSelect.getOrderByElements()) {
+                    if (!first) sb.append(", ");
+                    String orderStr = orderElem.toString();
+                    orderStr = convertOracleFunctions(orderStr);
+                    sb.append(orderStr);
+                    first = false;
+                }
+            }
+            
+            // 处理 Oracle 分页（FETCH FIRST ... ROWS ONLY 或 OFFSET ... ROWS FETCH NEXT ... ROWS ONLY）
+            // Oracle 使用 getFetch() 和 getOffset() 而不是 getLimit()
+            long offset = 0;
+            long rowCount = 0;
+            
+            // 获取 OFFSET（如果存在）
+            try {
+                Method getOffsetMethod = PlainSelect.class.getMethod("getOffset");
+                Object offsetObj = getOffsetMethod.invoke(plainSelect);
+                if (offsetObj != null) {
+                    // Offset 对象有 getOffset() 方法返回 LongValue
+                    try {
+                        Method getOffsetValueMethod = offsetObj.getClass().getMethod("getOffset");
+                        Object offsetValue = getOffsetValueMethod.invoke(offsetObj);
+                        if (offsetValue instanceof LongValue) {
+                            offset = ((LongValue) offsetValue).getValue();
+                        } else if (offsetValue instanceof Long) {
+                            offset = (Long) offsetValue;
+                        } else if (offsetValue != null) {
+                            offset = Long.parseLong(offsetValue.toString());
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从 toString() 解析
+                        String offsetStr = offsetObj.toString();
+                        Pattern offsetPattern = Pattern.compile("(?i)OFFSET\\s+(\\d+)\\s+ROWS?", Pattern.CASE_INSENSITIVE);
+                        Matcher m = offsetPattern.matcher(offsetStr);
+                        if (m.find()) {
+                            offset = Long.parseLong(m.group(1));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // getOffset() 方法不存在或失败，忽略
+            }
+            
+            // 获取 FETCH（如果存在）
+            try {
+                Method getFetchMethod = PlainSelect.class.getMethod("getFetch");
+                Object fetchObj = getFetchMethod.invoke(plainSelect);
+                if (fetchObj != null) {
+                    // Fetch 对象有 getExpression() 方法返回 LongValue
+                    try {
+                        Method getExpressionMethod = fetchObj.getClass().getMethod("getExpression");
+                        Object exprObj = getExpressionMethod.invoke(fetchObj);
+                        if (exprObj instanceof LongValue) {
+                            rowCount = ((LongValue) exprObj).getValue();
+                        } else if (exprObj instanceof Long) {
+                            rowCount = (Long) exprObj;
+                        } else if (exprObj != null) {
+                            rowCount = Long.parseLong(exprObj.toString());
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从 toString() 解析
+                        String fetchStr = fetchObj.toString();
+                        Pattern fetchPattern = Pattern.compile("(?i)FETCH\\s+(?:FIRST|NEXT)\\s+(\\d+)\\s+ROWS\\s+ONLY", Pattern.CASE_INSENSITIVE);
+                        Matcher m = fetchPattern.matcher(fetchStr);
+                        if (m.find()) {
+                            rowCount = Long.parseLong(m.group(1));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // getFetch() 方法不存在或失败，忽略
+            }
+            
+            // 如果有分页信息，生成 PostgreSQL 的 LIMIT/OFFSET 语句
+            if (rowCount > 0) {
+                sb.append(" LIMIT ").append(rowCount);
+            }
+            if (offset > 0) {
+                sb.append(" OFFSET ").append(offset);
+            }
+            
+            sb.append(";\n\n");
+        } else {
+            // 非 PlainSelect，直接转换
+            String selectStr = select.toString();
+            selectStr = convertOracleFunctions(selectStr);
+            sb.append(selectStr).append(";\n\n");
+        }
+        
+        return sb.toString();
     }
 
     /**
@@ -833,14 +1015,193 @@ public class OracleToPGVisitor extends StatementVisitorAdapter {
         String result = sql;
         // SYSDATE -> CURRENT_TIMESTAMP
         result = result.replaceAll("(?i)\\bSYSDATE\\b", "CURRENT_TIMESTAMP");
+        // SYSTIMESTAMP -> CURRENT_TIMESTAMP
+        result = result.replaceAll("(?i)\\bSYSTIMESTAMP\\b", "CURRENT_TIMESTAMP");
         // TO_DATE -> TO_TIMESTAMP
         result = result.replaceAll("(?i)\\bTO_DATE\\s*\\(", "TO_TIMESTAMP(");
         // NVL -> COALESCE
         result = result.replaceAll("(?i)\\bNVL\\s*\\(", "COALESCE(");
+        
+        // INTERVAL 转换（Oracle: INTERVAL '365' DAY，PostgreSQL: INTERVAL '365 days'）
+        // PostgreSQL 的 INTERVAL 格式是 '数值 单位'，单位可以是复数形式
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+YEAR", "INTERVAL '$1 years'");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+MONTH", "INTERVAL '$1 months'");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+DAY", "INTERVAL '$1 days'");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+HOUR", "INTERVAL '$1 hours'");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+MINUTE", "INTERVAL '$1 minutes'");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+SECOND", "INTERVAL '$1 seconds'");
+        
         // 标识符双引号保持（PostgreSQL 使用双引号）
         // 去掉反引号，转为双引号
         result = result.replace("`", "\"");
         return result;
+    }
+
+    /**
+     * 转换表达式（处理 Oracle 函数、INTERVAL、SYSDATE 等）
+     */
+    private String convertExpression(Expression expression) {
+        if (expression == null) return "";
+
+        if (expression instanceof StringValue) {
+            StringValue strVal = (StringValue) expression;
+            return "'" + strVal.getValue().replace("'", "''") + "'";
+        }
+        if (expression instanceof LongValue) {
+            LongValue longVal = (LongValue) expression;
+            return String.valueOf(longVal.getValue());
+        }
+        if (expression instanceof DoubleValue) {
+            DoubleValue doubleVal = (DoubleValue) expression;
+            return String.valueOf(doubleVal.getValue());
+        }
+        if (expression instanceof DateValue) {
+            DateValue dateVal = (DateValue) expression;
+            return "'" + dateVal.getValue() + "'";
+        }
+        if (expression instanceof Function) {
+            Function function = (Function) expression;
+            String functionName = function.getName();
+            List<Expression> params = new ArrayList<>();
+
+            ExpressionList exprList = function.getParameters();
+            if (exprList != null) {
+                params = exprList.getExpressions();
+            }
+
+            // 特殊处理 Oracle 函数
+            if ("TO_DATE".equalsIgnoreCase(functionName) && params != null && params.size() >= 2) {
+                String dateStr = params.get(0).toString();
+                String oracleFormat = params.get(1).toString().replaceAll("['\"]", "");
+                // PostgreSQL 使用 TO_TIMESTAMP，格式字符串类似
+                return "TO_TIMESTAMP(" + dateStr + ", " + "'" + oracleFormat + "')";
+            } else if ("SYSDATE".equalsIgnoreCase(functionName)) {
+                return "CURRENT_TIMESTAMP";
+            } else if ("SYSTIMESTAMP".equalsIgnoreCase(functionName)) {
+                return "CURRENT_TIMESTAMP";
+            } else if ("NVL".equalsIgnoreCase(functionName) && params != null && params.size() == 2) {
+                return "COALESCE(" + convertExpression(params.get(0)) + ", " + convertExpression(params.get(1)) + ")";
+            }
+
+            // 其他函数
+            StringBuilder funcCall = new StringBuilder(functionName).append("(");
+            if (params != null) {
+                for (int i = 0; i < params.size(); i++) {
+                    if (i > 0) funcCall.append(", ");
+                    funcCall.append(convertExpression(params.get(i)));
+                }
+            }
+            funcCall.append(")");
+            return funcCall.toString();
+        }
+        if (expression instanceof Column) {
+            Column column = (Column) expression;
+            String colName = column.getColumnName();
+            // 特殊处理：SYSDATE 被解析为 Column 而不是 Function
+            if ("SYSDATE".equalsIgnoreCase(colName) || "SYSTIMESTAMP".equalsIgnoreCase(colName)) {
+                return "CURRENT_TIMESTAMP";
+            }
+            return cleanIdentifier(colName);
+        }
+
+        // 处理 IntervalExpression（INTERVAL '365' DAY）
+        try {
+            // 检查是否是 IntervalExpression
+            if (expression.getClass().getSimpleName().contains("Interval")) {
+                String intervalStr = expression.toString();
+                // 使用 convertOracleFunctions 处理 INTERVAL 转换
+                intervalStr = convertOracleFunctions(intervalStr);
+                return intervalStr;
+            }
+        } catch (Exception ignore) {}
+
+        // 递归处理常见的表达式类型: 比如二元操作符等
+        try {
+            // 处理二元运算，如 AndExpression, EqualsTo 等
+            Method getLeft = expression.getClass().getMethod("getLeftExpression");
+            Method getRight = expression.getClass().getMethod("getRightExpression");
+            Object left = getLeft.invoke(expression);
+            Object right = getRight.invoke(expression);
+            String op = expression.getClass().getSimpleName();
+            String opStr;
+            // 还原运算符 (适用于大部分JSqlParser)
+            if (op.endsWith("AndExpression")) {
+                opStr = " AND ";
+            } else if (op.endsWith("OrExpression")) {
+                opStr = " OR ";
+            } else if (op.endsWith("EqualsTo")) {
+                opStr = " = ";
+            } else if (op.endsWith("NotEqualsTo")) {
+                opStr = " <> ";
+            } else if (op.endsWith("GreaterThan")) {
+                opStr = " > ";
+            } else if (op.endsWith("GreaterThanEquals")) {
+                opStr = " >= ";
+            } else if (op.endsWith("MinorThan")) {
+                opStr = " < ";
+            } else if (op.endsWith("MinorThanEquals")) {
+                opStr = " <= ";
+            } else if (op.endsWith("LikeExpression")) {
+                opStr = " LIKE ";
+            } else if (op.endsWith("InExpression")) {
+                opStr = " IN ";
+            } else if (op.contains("Subtraction") || op.contains("Minus")) {
+                // 减法运算符
+                opStr = " - ";
+            } else if (op.contains("Addition") || op.contains("Plus")) {
+                // 加法运算符
+                opStr = " + ";
+            } else if (op.contains("Multiplication")) {
+                // 乘法运算符
+                opStr = " * ";
+            } else if (op.contains("Division")) {
+                // 除法运算符
+                opStr = " / ";
+            } else if (op.endsWith("IsNullExpression")) {
+                // IS NULL/IS NOT NULL表达式
+                boolean not = false;
+                try {
+                    not = (boolean) expression.getClass().getMethod("isNot").invoke(expression);
+                } catch (Exception ignore) {}
+                return convertExpression((Expression) left) + (not ? " IS NOT NULL" : " IS NULL");
+            } else {
+                opStr = " " + op.replaceAll("Expression$", "") + " ";
+            }
+            return convertExpression((Expression) left) + opStr + convertExpression((Expression) right);
+        } catch (Exception ignore) {}
+
+        // 尝试括号表达式
+        try {
+            Method getExpr = expression.getClass().getMethod("getExpression");
+            Object exprObj = getExpr.invoke(expression);
+            return "(" + convertExpression((Expression) exprObj) + ")";
+        } catch (Exception ignore) {}
+
+        // 处理IN (xxx, yyy)结构
+        try {
+            Method getLeft = expression.getClass().getMethod("getLeftExpression");
+            Object left = getLeft.invoke(expression);
+            Method getRightItems = expression.getClass().getMethod("getRightItemsList");
+            Object rightItems = getRightItems.invoke(expression);
+            if (rightItems instanceof ExpressionList) {
+                @SuppressWarnings("unchecked")
+                List<Expression> exprs = ((ExpressionList) rightItems).getExpressions();
+                StringBuilder sb = new StringBuilder();
+                sb.append(convertExpression((Expression) left)).append(" IN (");
+                for (int i = 0; i < exprs.size(); i++) {
+                    if (i != 0) sb.append(", ");
+                    sb.append(convertExpression(exprs.get(i)));
+                }
+                sb.append(")");
+                return sb.toString();
+            }
+        } catch (Exception ignore) {}
+
+        // 其他表达式 fallback
+        // 先使用 convertOracleFunctions 处理 SYSDATE 和 INTERVAL
+        String exprStr = expression.toString();
+        exprStr = convertOracleFunctions(exprStr);
+        return exprStr;
     }
 
     /**

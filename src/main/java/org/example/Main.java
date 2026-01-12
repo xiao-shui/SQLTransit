@@ -20,14 +20,14 @@ public class Main {
     public static void main(String[] args) {
 //        OracleToGDBVisitor oracleToGDBVisitor = new OracleToGDBVisitor();
 //        MysqlToOracleVisitor mysqlToOracleVisitor = new MysqlToOracleVisitor();
-//        OracleToMysqlVisitor oracleToMysqlVisitor = new OracleToMysqlVisitor();
+        OracleToMysqlVisitor oracleToMysqlVisitor = new OracleToMysqlVisitor();
 //        MysqlToPGVisitor mysqlToPGVisitor = new MysqlToPGVisitor();
-        PGToMysqlVisitor pgToMysqlVisitor = new PGToMysqlVisitor();
-//        OracleToPGVisitor oracleToPGVisitor = new OracleToPGVisitor();
-        PGToOracleVisitor pgToOracleVisitor = new PGToOracleVisitor();
+//        PGToMysqlVisitor pgToMysqlVisitor = new PGToMysqlVisitor();
+        OracleToPGVisitor oracleToPGVisitor = new OracleToPGVisitor();
+//        PGToOracleVisitor pgToOracleVisitor = new PGToOracleVisitor();
 
 
-        String filePath = "D:\\桌面\\脚本\\PG脚本.sql";
+        String filePath = "D:\\桌面\\脚本\\transit.sql";
         String outputPath = "D:\\桌面\\脚本\\result.sql";
         String mysqlSql = null;
         List<Statement> statements = null;
@@ -47,10 +47,10 @@ public class Main {
         }
 
         for (Statement stmt : statements) {
-            stmt.accept(pgToMysqlVisitor);
+            stmt.accept(oracleToMysqlVisitor);
         }
 
-        String resultSql = pgToMysqlVisitor.getMysqlSql();
+        String resultSql = oracleToMysqlVisitor.getMysqlSql();
 
         //resultSql = GDBPosProcess.postprocess(resultSql);
 

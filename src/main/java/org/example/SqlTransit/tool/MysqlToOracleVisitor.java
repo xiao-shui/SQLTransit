@@ -10,7 +10,10 @@ import net.sf.jsqlparser.statement.delete.Delete;
 import net.sf.jsqlparser.statement.update.Update;
 import net.sf.jsqlparser.statement.alter.Alter;
 import net.sf.jsqlparser.statement.alter.AlterExpression;
+import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.expression.Expression;
+import net.sf.jsqlparser.expression.LongValue;
 import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.StatementVisitorAdapter;
@@ -95,7 +98,6 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
     // 工具方法：大写 WHERE 中的列名（跳过关键字和函数）
     private String uppercaseWhereColumnNames(String sql) {
         StringBuilder sb = new StringBuilder();
-        boolean inString = false;
         int i = 0;
 
         while (i < sql.length()) {
@@ -161,15 +163,6 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 .contains(token.toUpperCase());
     }
 
-    // 工具方法：处理 WHERE 条件表达式
-    private String processWhereExpression(Expression where) {
-        if (where == null) return "";
-        String expr = where.toString();
-        expr = expr.replace("CURRENT_TIMESTAMP", "SYSDATE");
-        expr = replaceBooleanLiterals(expr);
-        expr = uppercaseWhereColumnNames(expr);
-        return " WHERE " + expr;
-    }
 
     // 工具方法：生成主键约束名称（格式：pk_列名，小写）
     private String generatePrimaryKeyConstraintName(String tableName, List<String> primaryKeyCols) {
@@ -182,6 +175,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
     }
 
     // 工具方法：提取表的注释（获取CREATE TABLE末尾的COMMENT='xxx'）
+    @SuppressWarnings("unchecked")
     private String extractTableComment(CreateTable createTable) {
         // 方法1：直接访问 tableOptionsStrings
         try {
@@ -1004,8 +998,6 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         
         // 如果 AlterExpression 解析失败，尝试直接从 alter.toString() 解析
         if (expressions == null || expressions.isEmpty()) {
-            String alterStrUpper = alterStr.toUpperCase();
-            
             // 解析 ADD CONSTRAINT PRIMARY KEY
             Pattern pkPattern = Pattern.compile(
                     "ADD\\s+CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
@@ -1120,54 +1112,304 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         oracleSql.append(alterStr).append(";\n\n");
     }
 
+    // 工具方法：转换 MySQL 函数为 Oracle 函数
+    private String convertMysqlFunctions(String sql) {
+        if (sql == null) return "";
+        String result = sql;
+        // NOW() -> SYSDATE
+        result = result.replaceAll("(?i)\\bNOW\\s*\\(\\s*\\)", "SYSDATE");
+        // CURRENT_TIMESTAMP -> SYSDATE
+        result = result.replaceAll("(?i)\\bCURRENT_TIMESTAMP\\b", "SYSDATE");
+        // IFNULL -> NVL
+        result = result.replaceAll("(?i)\\bIFNULL\\s*\\(", "NVL(");
+        // INTERVAL 转换（MySQL: INTERVAL 1 YEAR，Oracle: NUMTODSINTERVAL 或 INTERVAL '1' YEAR）
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+YEAR", "INTERVAL '$1' YEAR");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+MONTH", "INTERVAL '$1' MONTH");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+DAY", "INTERVAL '$1' DAY");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+HOUR", "INTERVAL '$1' HOUR");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+MINUTE", "INTERVAL '$1' MINUTE");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+SECOND", "INTERVAL '$1' SECOND");
+        return result;
+    }
+
     // 处理 INSERT
     @Override
     public void visit(Insert insert) {
         String tableName = getFullTableName(insert.getTable());
-        oracleSql.append("INSERT INTO ").append(tableName);
-
         List<Column> columns = insert.getColumns();
+        
+        // 生成列名部分（如果有）
+        StringBuilder columnPart = new StringBuilder();
         if (columns != null && !columns.isEmpty()) {
-            oracleSql.append("(");
+            columnPart.append(" (");
             for (int i = 0; i < columns.size(); i++) {
                 String colName = cleanIdentifier(columns.get(i).getColumnName());
-                oracleSql.append(colName);
-                if (i < columns.size() - 1) oracleSql.append(", ");
+                columnPart.append(colName);
+                if (i < columns.size() - 1) columnPart.append(", ");
             }
-            oracleSql.append(")");
+            columnPart.append(")");
         }
 
-        String valuesStr = insert.toString().toUpperCase();
-        int valuesIdx = valuesStr.indexOf("VALUES");
-        String valuesPart = "";
+        // 尝试从 Insert 对象获取 Values
+        try {
+            Method getValuesMethod = Insert.class.getMethod("getValues");
+            Object valuesObj = getValuesMethod.invoke(insert);
+            
+            if (valuesObj != null) {
+                // 处理 ExpressionList（单行或多行）
+                List<List<Expression>> valueRows = extractInsertValueRows(valuesObj);
+                
+                if (valueRows != null && !valueRows.isEmpty()) {
+                    // 如果是多行插入，为每一行生成一个独立的 INSERT 语句
+                    for (int i = 0; i < valueRows.size(); i++) {
+                        List<Expression> rowExprs = valueRows.get(i);
+                        oracleSql.append("INSERT INTO ").append(tableName).append(columnPart);
+                        oracleSql.append(" VALUES (");
+                        
+                        for (int j = 0; j < rowExprs.size(); j++) {
+                            if (j > 0) oracleSql.append(", ");
+                            String exprStr = rowExprs.get(j).toString();
+                            exprStr = convertMysqlFunctions(exprStr);
+                            exprStr = replaceBooleanLiterals(exprStr);
+                            oracleSql.append(exprStr);
+                        }
+                        
+                        oracleSql.append(");\n");
+                    }
+                    oracleSql.append("\n");
+                    return;
+                }
+            }
+        } catch (Exception e) {
+            // 如果反射失败，尝试从 toString() 解析
+        }
+        
+        // 回退：从 toString() 解析（单行或多行）
+        String insertStr = insert.toString();
+        int valuesIdx = insertStr.toUpperCase().indexOf("VALUES");
         if (valuesIdx != -1) {
-            valuesPart = insert.toString().substring(valuesIdx + 6);
-            valuesPart = valuesPart.replace("CURRENT_TIMESTAMP", "SYSDATE");
+            String valuesPart = insertStr.substring(valuesIdx + 6).trim();
+            valuesPart = convertMysqlFunctions(valuesPart);
             valuesPart = replaceBooleanLiterals(valuesPart);
+            
+            // 检查是否是多行插入（包含多个括号对）
+            if (isMultiRowInsert(valuesPart)) {
+                // 解析多行值
+                List<String> valueRows = parseMultiRowValues(valuesPart);
+                for (String valueRow : valueRows) {
+                    oracleSql.append("INSERT INTO ").append(tableName).append(columnPart);
+                    oracleSql.append(" VALUES ").append(valueRow).append(";\n");
+                }
+                oracleSql.append("\n");
+                return;
+            }
+            
+            // 单行插入
+            oracleSql.append("INSERT INTO ").append(tableName).append(columnPart);
+            oracleSql.append(" VALUES ").append(valuesPart);
+        } else {
+            // 无法解析，使用原始格式
+            oracleSql.append("INSERT INTO ").append(tableName).append(columnPart);
         }
 
-        oracleSql.append(" VALUES").append(valuesPart).append(";\n\n");
+        oracleSql.append(";\n\n");
+    }
+
+    // 辅助方法：从 valuesObj 中提取多行值
+    @SuppressWarnings("unchecked")
+    private List<List<Expression>> extractInsertValueRows(Object valuesObj) {
+        if (valuesObj == null) return null;
+        
+        try {
+            // 尝试获取 getExpressions() 方法
+            Method getExprsMethod = valuesObj.getClass().getMethod("getExpressions");
+            Object exprsObj = getExprsMethod.invoke(valuesObj);
+            
+            if (exprsObj instanceof List) {
+                List<Expression> expressions = (List<Expression>) exprsObj;
+                
+                if (expressions.isEmpty()) {
+                    return null;
+                }
+                
+                // 检查是否是多行插入（第一个元素以括号开头，可能是 ParenthesedExpressionList）
+                String firstExprStr = expressions.get(0).toString().trim();
+                if (firstExprStr.startsWith("(")) {
+                    // 多行插入：每个元素是一行
+                    List<List<Expression>> rows = new ArrayList<>();
+                    for (Expression expr : expressions) {
+                        // 尝试从每个 Expression 中提取表达式列表
+                        try {
+                            Method getExprsInExpr = expr.getClass().getMethod("getExpressions");
+                            Object innerExprsObj = getExprsInExpr.invoke(expr);
+                            if (innerExprsObj instanceof List) {
+                                rows.add((List<Expression>) innerExprsObj);
+                            } else {
+                                // 如果不是列表，可能是单个表达式，创建单元素列表
+                                List<Expression> singleRow = new ArrayList<>();
+                                singleRow.add(expr);
+                                rows.add(singleRow);
+                            }
+                        } catch (Exception e) {
+                            // 无法获取内部表达式，尝试将整个表达式作为单个值
+                            // 这种情况需要从字符串解析
+                            String exprStr = expr.toString();
+                            // 解析括号内的值：('Bob', 'bob@example.com')
+                            List<Expression> row = parseExpressionListFromString(exprStr);
+                            if (row != null && !row.isEmpty()) {
+                                rows.add(row);
+                            }
+                        }
+                    }
+                    return rows.isEmpty() ? null : rows;
+                } else {
+                    // 单行插入：所有表达式组成一行
+                    List<List<Expression>> rows = new ArrayList<>();
+                    rows.add(expressions);
+                    return rows;
+                }
+            }
+        } catch (Exception e) {
+            // 如果解析失败，返回 null，让调用者使用 toString() 解析
+        }
+        
+        return null;
+    }
+    
+    // 辅助方法：从字符串解析表达式列表（简单实现，主要用于回退）
+    private List<Expression> parseExpressionListFromString(String exprStr) {
+        // 这是一个简化实现，实际应该使用 JSQLParser 来解析
+        // 这里返回 null，让调用者使用其他方法
+        return null;
+    }
+    
+    // 辅助方法：检查是否是多行插入
+    private boolean isMultiRowInsert(String valuesPart) {
+        if (valuesPart == null || valuesPart.trim().isEmpty()) {
+            return false;
+        }
+        
+        // 简单判断：如果包含 "), (" 模式，很可能是多行插入
+        Pattern multiRowPattern = Pattern.compile("\\)\\s*,\\s*\\(");
+        return multiRowPattern.matcher(valuesPart).find();
+    }
+    
+    // 辅助方法：解析多行值字符串
+    private List<String> parseMultiRowValues(String valuesPart) {
+        List<String> rows = new ArrayList<>();
+        
+        if (valuesPart == null || valuesPart.trim().isEmpty()) {
+            return rows;
+        }
+        
+        // 使用正则表达式或手动解析，将 "('val1', 'val2'), ('val3', 'val4')" 
+        // 分割成 ["('val1', 'val2')", "('val3', 'val4')"]
+        
+        List<String> result = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        int depth = 0;
+        boolean inString = false;
+        char stringChar = 0;
+        int startPos = -1;
+        
+        for (int i = 0; i < valuesPart.length(); i++) {
+            char c = valuesPart.charAt(i);
+            
+            if (!inString && (c == '\'' || c == '"')) {
+                inString = true;
+                stringChar = c;
+                if (depth == 0 && startPos == -1) {
+                    startPos = i;
+                }
+                current.append(c);
+            } else if (inString && c == stringChar && (i == 0 || valuesPart.charAt(i-1) != '\\')) {
+                inString = false;
+                current.append(c);
+            } else if (!inString && c == '(') {
+                if (depth == 0) {
+                    startPos = i;
+                    current = new StringBuilder();
+                }
+                depth++;
+                current.append(c);
+            } else if (!inString && c == ')') {
+                current.append(c);
+                depth--;
+                if (depth == 0) {
+                    // 找到一个完整的值行
+                    String row = current.toString().trim();
+                    if (!row.isEmpty()) {
+                        result.add(row);
+                    }
+                    current = new StringBuilder();
+                    startPos = -1;
+                    // 跳过可能的逗号和空格
+                    while (i + 1 < valuesPart.length() && 
+                           (valuesPart.charAt(i + 1) == ',' || 
+                            Character.isWhitespace(valuesPart.charAt(i + 1)))) {
+                        i++;
+                    }
+                }
+            } else {
+                current.append(c);
+            }
+        }
+        
+        // 如果还有剩余的内容（单行插入的情况）
+        if (depth == 0 && current.length() > 0) {
+            String row = current.toString().trim();
+            if (!row.isEmpty()) {
+                result.add(row);
+            }
+        }
+        
+        return result.isEmpty() ? Arrays.asList(valuesPart.trim()) : result;
     }
 
     // 处理 UPDATE
     @Override
+    @SuppressWarnings("deprecation")
     public void visit(Update update) {
         String tableName = getFullTableName(update.getTable());
         oracleSql.append("UPDATE ").append(tableName).append(" SET ");
 
         List<Column> cols = update.getColumns();
-        List<Expression> exprs = update.getExpressions();
+        @SuppressWarnings("unchecked")
+        List<Expression> exprs = (List<Expression>) (List<?>) update.getExpressions();
+        
         for (int i = 0; i < cols.size(); i++) {
             String colName = cleanIdentifier(cols.get(i).getColumnName());
-            String valueExpr = exprs.get(i).toString();
-            valueExpr = valueExpr.replace("CURRENT_TIMESTAMP", "SYSDATE");
-            valueExpr = replaceBooleanLiterals(valueExpr);
-            valueExpr = uppercaseWhereColumnNames(valueExpr);
-            oracleSql.append(colName).append("=").append(valueExpr);
+            Expression expr = exprs.get(i);
+            String valueExpr = convertExpression(expr);
+            oracleSql.append(colName).append(" = ").append(valueExpr);
             if (i < cols.size() - 1) oracleSql.append(", ");
         }
 
-        oracleSql.append(processWhereExpression(update.getWhere())).append(";\n\n");
+        Expression where = update.getWhere();
+        if (where != null) {
+            String whereStr = convertExpression(where);
+            oracleSql.append(" WHERE ").append(whereStr);
+        }
+
+        oracleSql.append(";\n\n");
+    }
+
+    // 辅助方法：转换表达式（处理 MySQL 函数、布尔值、列名等）
+    private String convertExpression(Expression expr) {
+        if (expr == null) return "";
+        
+        String exprStr = expr.toString();
+        
+        // 转换 MySQL 函数为 Oracle 函数
+        exprStr = convertMysqlFunctions(exprStr);
+        
+        // 替换布尔值
+        exprStr = replaceBooleanLiterals(exprStr);
+        
+        // 转换列名为大写（跳过字符串和函数）
+        exprStr = uppercaseWhereColumnNames(exprStr);
+        
+        return exprStr;
     }
 
     // 处理 DELETE
@@ -1175,7 +1417,135 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
     public void visit(Delete delete) {
         String tableName = getFullTableName(delete.getTable());
         oracleSql.append("DELETE FROM ").append(tableName);
-        oracleSql.append(processWhereExpression(delete.getWhere())).append(";\n\n");
+        
+        Expression where = delete.getWhere();
+        if (where != null) {
+            String whereStr = convertExpression(where);
+            oracleSql.append(" WHERE ").append(whereStr);
+        }
+        
+        oracleSql.append(";\n\n");
+    }
+
+    // 处理 SELECT
+    @Override
+    @SuppressWarnings("deprecation")
+    public void visit(Select select) {
+        if (select.getSelectBody() instanceof PlainSelect) {
+            PlainSelect plainSelect = (PlainSelect) select.getSelectBody();
+            
+            // 处理 SELECT 列表
+            oracleSql.append("SELECT ");
+            if (plainSelect.getSelectItems() != null) {
+                boolean first = true;
+                for (Object item : plainSelect.getSelectItems()) {
+                    if (!first) oracleSql.append(", ");
+                    String itemStr = item.toString();
+                    // 转换列名为大写
+                    itemStr = uppercaseWhereColumnNames(itemStr);
+                    oracleSql.append(itemStr);
+                    first = false;
+                }
+            } else {
+                oracleSql.append("*");
+            }
+            
+            // 处理 FROM
+            if (plainSelect.getFromItem() != null) {
+                String fromStr = plainSelect.getFromItem().toString();
+                // 转换表名为大写，保留 schema
+                if (plainSelect.getFromItem() instanceof Table) {
+                    Table table = (Table) plainSelect.getFromItem();
+                    fromStr = getFullTableName(table);
+                } else {
+                    fromStr = uppercaseWhereColumnNames(fromStr);
+                }
+                oracleSql.append(" FROM ").append(fromStr);
+            }
+            
+            // 处理 WHERE
+            if (plainSelect.getWhere() != null) {
+                String whereStr = convertExpression(plainSelect.getWhere());
+                oracleSql.append(" WHERE ").append(whereStr);
+            }
+            
+            // 处理 ORDER BY
+            if (plainSelect.getOrderByElements() != null) {
+                oracleSql.append(" ORDER BY ");
+                boolean first = true;
+                for (Object orderElem : plainSelect.getOrderByElements()) {
+                    if (!first) oracleSql.append(", ");
+                    String orderStr = orderElem.toString();
+                    orderStr = uppercaseWhereColumnNames(orderStr);
+                    oracleSql.append(orderStr);
+                    first = false;
+                }
+            }
+            
+            // 处理 LIMIT -> ROWNUM 或 FETCH FIRST
+            if (plainSelect.getLimit() != null) {
+                try {
+                    Object limitObj = plainSelect.getLimit();
+                    Method getRowCountMethod = limitObj.getClass().getMethod("getRowCount");
+                    Object rowCountObj = getRowCountMethod.invoke(limitObj);
+                    
+                    long rowCount = 0;
+                    if (rowCountObj instanceof LongValue) {
+                        rowCount = ((LongValue) rowCountObj).getValue();
+                    } else if (rowCountObj instanceof Long) {
+                        rowCount = (Long) rowCountObj;
+                    } else if (rowCountObj != null) {
+                        rowCount = Long.parseLong(rowCountObj.toString());
+                    }
+                    
+                    if (rowCount > 0) {
+                        // 检查是否有 OFFSET
+                        try {
+                            Method getOffsetMethod = limitObj.getClass().getMethod("getOffset");
+                            Object offsetObj = getOffsetMethod.invoke(limitObj);
+                            long offset = 0;
+                            if (offsetObj instanceof LongValue) {
+                                offset = ((LongValue) offsetObj).getValue();
+                            } else if (offsetObj instanceof Long) {
+                                offset = (Long) offsetObj;
+                            } else if (offsetObj != null) {
+                                offset = Long.parseLong(offsetObj.toString());
+                            }
+                            
+                            if (offset > 0) {
+                                // Oracle 12c+ 使用 OFFSET ... ROWS FETCH NEXT ... ROWS ONLY
+                                oracleSql.append(" OFFSET ").append(offset).append(" ROWS FETCH NEXT ").append(rowCount).append(" ROWS ONLY");
+                            } else {
+                                // 使用 FETCH FIRST ... ROWS ONLY (Oracle 12c+)
+                                oracleSql.append(" FETCH FIRST ").append(rowCount).append(" ROWS ONLY");
+                            }
+                        } catch (Exception e) {
+                            // 没有 OFFSET，使用 FETCH FIRST
+                            oracleSql.append(" FETCH FIRST ").append(rowCount).append(" ROWS ONLY");
+                        }
+                    }
+                } catch (Exception e) {
+                    // 如果解析失败，尝试使用 ROWNUM 方式（Oracle 11g 及以下）
+                    String limitStr = plainSelect.getLimit().toString();
+                    // 简单提取数字
+                    java.util.regex.Pattern limitPattern = Pattern.compile("LIMIT\\s+(\\d+)", Pattern.CASE_INSENSITIVE);
+                    java.util.regex.Matcher limitMatcher = limitPattern.matcher(limitStr);
+                    if (limitMatcher.find()) {
+                        long rowCount = Long.parseLong(limitMatcher.group(1));
+                        oracleSql.append(" FETCH FIRST ").append(rowCount).append(" ROWS ONLY");
+                    }
+                }
+            }
+            
+            oracleSql.append(";\n\n");
+        } else {
+            // 非 PlainSelect，直接转换
+            String selectStr = select.toString();
+            selectStr = convertMysqlFunctions(selectStr);
+            selectStr = replaceBooleanLiterals(selectStr);
+            selectStr = uppercaseWhereColumnNames(selectStr);
+            oracleSql.append(selectStr).append(";\n\n");
+        }
     }
 
     // 获取最终 Oracle SQL

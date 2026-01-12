@@ -1,9 +1,17 @@
 package org.example.SqlTransit.tool;
 
 import net.sf.jsqlparser.expression.Expression;
+import net.sf.jsqlparser.expression.Function;
+import net.sf.jsqlparser.expression.StringValue;
+import net.sf.jsqlparser.expression.DoubleValue;
+import net.sf.jsqlparser.expression.DateValue;
+import net.sf.jsqlparser.expression.LongValue;
+import net.sf.jsqlparser.expression.operators.relational.ExpressionList;
 import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.schema.Table;
 import net.sf.jsqlparser.statement.StatementVisitorAdapter;
+import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.alter.Alter;
 import net.sf.jsqlparser.statement.alter.AlterExpression;
 import net.sf.jsqlparser.statement.comment.Comment;
@@ -124,7 +132,7 @@ public class PGToOracleVisitor extends StatementVisitorAdapter {
                 return "NUMBER";
             case "INT8":
             case "BIGINT":
-                return "NUMBER(38)";
+                return "NUMBER(19)";
             case "INT4":
             case "INT":
                 return "NUMBER(10)";
@@ -145,8 +153,17 @@ public class PGToOracleVisitor extends StatementVisitorAdapter {
                 return "BLOB";
             case "TIMESTAMP":
             case "TIMESTAMP WITHOUT TIME ZONE":
+                // PostgreSQL TIMESTAMP(0) 明确指定了 0 位小数秒精度，需要转换为 TIMESTAMP(0)
+                // Oracle 的 TIMESTAMP 默认包含微秒精度，所以需要保留精度参数
+                if (args != null && !args.isEmpty()) {
+                    return "TIMESTAMP(" + args.get(0) + ")";
+                }
                 return "TIMESTAMP";
             case "TIMESTAMP WITH TIME ZONE":
+                // TIMESTAMP WITH TIME ZONE 也支持精度参数
+                if (args != null && !args.isEmpty()) {
+                    return "TIMESTAMP(" + args.get(0) + ") WITH TIME ZONE";
+                }
                 return "TIMESTAMP WITH TIME ZONE";
             case "DATE":
                 return "DATE";
@@ -192,10 +209,14 @@ public class PGToOracleVisitor extends StatementVisitorAdapter {
         // 如果存在 schema，则保留 schema.table
         Table table = createTable.getTable();
         String tableName;
-        if (table != null && table.getSchemaName() != null && !table.getSchemaName().isEmpty()) {
-            tableName = cleanIdentifier(table.getSchemaName()) + "." + cleanIdentifier(table.getName());
+        if (table != null) {
+            if (table.getSchemaName() != null && !table.getSchemaName().isEmpty()) {
+                tableName = cleanIdentifier(table.getSchemaName()) + "." + cleanIdentifier(table.getName());
+            } else {
+                tableName = cleanIdentifier(table.getName());
+            }
         } else {
-            tableName = cleanIdentifier(table.getName());
+            tableName = "UNKNOWN_TABLE";
         }
         sb.append("CREATE TABLE ").append(tableName).append(" (\n");
 
@@ -727,6 +748,11 @@ public class PGToOracleVisitor extends StatementVisitorAdapter {
 
     @Override
     public void visit(Insert insert) {
+        String sql = convertInsert(insert);
+        addRawSql(sql);
+    }
+
+    private String convertInsert(Insert insert) {
         StringBuilder sb = new StringBuilder();
         String tableName = cleanIdentifier(insert.getTable().getName());
         sb.append("INSERT INTO ").append(tableName);
@@ -741,20 +767,63 @@ public class PGToOracleVisitor extends StatementVisitorAdapter {
             sb.append(")");
         }
 
-        String valuesStr = insert.toString();
-        int idx = valuesStr.toUpperCase(Locale.ROOT).indexOf("VALUES");
-        String valuesPart = "";
-        if (idx != -1) {
-            valuesPart = valuesStr.substring(idx + 6);
-            valuesPart = convertPostgresqlFunctions(valuesPart);
+        try {
+            // PostgreSQL 使用 getValues() 方法获取 Values 对象
+            Method getValuesMethod = Insert.class.getMethod("getValues");
+            Object values = getValuesMethod.invoke(insert);
+
+            if (values != null) {
+                // Values 对象有 getExpressions() 方法
+                try {
+                    Method getExpressionsMethod = values.getClass().getMethod("getExpressions");
+                    Object exprsObj = getExpressionsMethod.invoke(values);
+                    if (exprsObj instanceof List) {
+                        @SuppressWarnings("unchecked")
+                        List<Expression> expressions = (List<Expression>) exprsObj;
+                        sb.append(" VALUES (");
+                        for (int i = 0; i < expressions.size(); i++) {
+                            Expression expr = expressions.get(i);
+                            sb.append(convertExpression(expr));
+                            if (i < expressions.size() - 1) {
+                                sb.append(", ");
+                            }
+                        }
+                        sb.append(")");
+                    }
+                } catch (Exception e) {
+                    // 如果反射失败，使用 toString() 作为回退
+                    String valuesStr = values.toString();
+                    int idx = valuesStr.toUpperCase(Locale.ROOT).indexOf("VALUES");
+                    String valuesPart = "";
+                    if (idx != -1) {
+                        valuesPart = valuesStr.substring(idx + 6);
+                        valuesPart = convertPostgresqlFunctions(valuesPart);
+                    }
+                    sb.append(" VALUES").append(valuesPart);
+                }
+            }
+        } catch (Exception e) {
+            // 如果反射失败，使用 toString() 作为回退
+            String valuesStr = insert.toString();
+            int idx = valuesStr.toUpperCase(Locale.ROOT).indexOf("VALUES");
+            String valuesPart = "";
+            if (idx != -1) {
+                valuesPart = valuesStr.substring(idx + 6);
+                valuesPart = convertPostgresqlFunctions(valuesPart);
+            }
+            sb.append(" VALUES").append(valuesPart);
         }
 
-        sb.append(" VALUES").append(valuesPart).append(";\n\n");
-        addRawSql(sb.toString());
+        return sb.append(";\n\n").toString();
     }
 
     @Override
     public void visit(Update update) {
+        String sql = convertUpdate(update);
+        addRawSql(sql);
+    }
+
+    private String convertUpdate(Update update) {
         StringBuilder sb = new StringBuilder();
         String tableName = cleanIdentifier(update.getTable().getName());
         sb.append("UPDATE ").append(tableName).append(" SET ");
@@ -765,34 +834,180 @@ public class PGToOracleVisitor extends StatementVisitorAdapter {
 
         for (int i = 0; i < cols.size(); i++) {
             String colName = cleanIdentifier(cols.get(i).getColumnName());
-            String valueExpr = exprs.get(i).toString();
-            valueExpr = convertPostgresqlFunctions(valueExpr);
-            sb.append(colName).append(" = ").append(valueExpr);
-            if (i < cols.size() - 1) sb.append(", ");
+            Expression expression = exprs.get(i);
+            sb.append(colName).append(" = ");
+            sb.append(convertExpression(expression));
+            if (i < cols.size() - 1) {
+                sb.append(", ");
+            }
         }
 
         Expression where = update.getWhere();
         if (where != null) {
-            sb.append(" WHERE ").append(convertPostgresqlFunctions(where.toString()));
+            sb.append(" WHERE ").append(convertExpression(where));
         }
 
-        sb.append(";\n\n");
-        addRawSql(sb.toString());
+        return sb.append(";\n\n").toString();
     }
 
     @Override
     public void visit(Delete delete) {
+        String sql = convertDelete(delete);
+        addRawSql(sql);
+    }
+
+    private String convertDelete(Delete delete) {
         StringBuilder sb = new StringBuilder();
         String tableName = cleanIdentifier(delete.getTable().getName());
         sb.append("DELETE FROM ").append(tableName);
 
         Expression where = delete.getWhere();
         if (where != null) {
-            sb.append(" WHERE ").append(convertPostgresqlFunctions(where.toString()));
+            sb.append(" WHERE ").append(convertExpression(where));
         }
 
-        sb.append(";\n\n");
-        addRawSql(sb.toString());
+        return sb.append(";\n\n").toString();
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    public void visit(Select select) {
+        String sql = convertSelect(select);
+        addRawSql(sql);
+    }
+
+    private String convertSelect(Select select) {
+        StringBuilder sb = new StringBuilder();
+        
+        if (select.getSelectBody() instanceof PlainSelect) {
+            PlainSelect plainSelect = (PlainSelect) select.getSelectBody();
+            
+            // 处理 SELECT 列表
+            sb.append("SELECT ");
+            if (plainSelect.getSelectItems() != null) {
+                boolean first = true;
+                for (Object item : plainSelect.getSelectItems()) {
+                    if (!first) sb.append(", ");
+                    String itemStr = item.toString();
+                    itemStr = convertPostgresqlFunctions(itemStr);
+                    sb.append(itemStr);
+                    first = false;
+                }
+            } else {
+                sb.append("*");
+            }
+            
+            // 处理 FROM
+            if (plainSelect.getFromItem() != null) {
+                String fromStr = plainSelect.getFromItem().toString();
+                // 转换表名
+                if (plainSelect.getFromItem() instanceof Table) {
+                    Table table = (Table) plainSelect.getFromItem();
+                    if (table.getSchemaName() != null && !table.getSchemaName().isEmpty()) {
+                        fromStr = cleanIdentifier(table.getSchemaName()) + "." + cleanIdentifier(table.getName());
+                    } else {
+                        fromStr = cleanIdentifier(table.getName());
+                    }
+                } else {
+                    fromStr = convertPostgresqlFunctions(fromStr);
+                }
+                sb.append(" FROM ").append(fromStr);
+            }
+            
+            // 处理 WHERE
+            if (plainSelect.getWhere() != null) {
+                String whereStr = convertExpression(plainSelect.getWhere());
+                sb.append(" WHERE ").append(whereStr);
+            }
+            
+            // 处理 ORDER BY
+            if (plainSelect.getOrderByElements() != null) {
+                sb.append(" ORDER BY ");
+                boolean first = true;
+                for (Object orderElem : plainSelect.getOrderByElements()) {
+                    if (!first) sb.append(", ");
+                    String orderStr = orderElem.toString();
+                    orderStr = convertPostgresqlFunctions(orderStr);
+                    sb.append(orderStr);
+                    first = false;
+                }
+            }
+            
+            // 处理 PostgreSQL 的 LIMIT 和 OFFSET，转换为 Oracle 的 FETCH FIRST/OFFSET
+            long offset = 0;
+            long rowCount = 0;
+            
+            // 获取 OFFSET（如果存在）
+            if (plainSelect.getOffset() != null) {
+                try {
+                    Object offsetObj = plainSelect.getOffset();
+                    Method getOffsetMethod = offsetObj.getClass().getMethod("getOffset");
+                    Object offsetValue = getOffsetMethod.invoke(offsetObj);
+                    
+                    if (offsetValue instanceof LongValue) {
+                        offset = ((LongValue) offsetValue).getValue();
+                    } else if (offsetValue instanceof Long) {
+                        offset = (Long) offsetValue;
+                    } else if (offsetValue != null) {
+                        offset = Long.parseLong(offsetValue.toString());
+                    }
+                } catch (Exception e) {
+                    // 如果解析失败，尝试从字符串解析
+                    String offsetStr = plainSelect.getOffset().toString();
+                    Pattern offsetPattern = Pattern.compile("(?i)OFFSET\\s+(\\d+)", Pattern.CASE_INSENSITIVE);
+                    Matcher m = offsetPattern.matcher(offsetStr);
+                    if (m.find()) {
+                        offset = Long.parseLong(m.group(1));
+                    }
+                }
+            }
+            
+            // 获取 LIMIT（如果存在）
+            if (plainSelect.getLimit() != null) {
+                try {
+                    Object limitObj = plainSelect.getLimit();
+                    Method getRowCountMethod = limitObj.getClass().getMethod("getRowCount");
+                    Object rowCountObj = getRowCountMethod.invoke(limitObj);
+                    
+                    if (rowCountObj instanceof LongValue) {
+                        rowCount = ((LongValue) rowCountObj).getValue();
+                    } else if (rowCountObj instanceof Long) {
+                        rowCount = (Long) rowCountObj;
+                    } else if (rowCountObj != null) {
+                        rowCount = Long.parseLong(rowCountObj.toString());
+                    }
+                } catch (Exception e) {
+                    // 如果解析失败，尝试从字符串解析
+                    String limitStr = plainSelect.getLimit().toString();
+                    Pattern limitPattern = Pattern.compile("(?i)LIMIT\\s+(\\d+)", Pattern.CASE_INSENSITIVE);
+                    Matcher m = limitPattern.matcher(limitStr);
+                    if (m.find()) {
+                        rowCount = Long.parseLong(m.group(1));
+                    }
+                }
+            }
+            
+            // 转换为 Oracle 分页语法
+            if (offset > 0) {
+                sb.append(" OFFSET ").append(offset).append(" ROWS");
+            }
+            if (rowCount > 0) {
+                if (offset > 0) {
+                    sb.append(" FETCH NEXT ").append(rowCount).append(" ROWS ONLY");
+                } else {
+                    sb.append(" FETCH FIRST ").append(rowCount).append(" ROWS ONLY");
+                }
+            }
+            
+            sb.append(";\n\n");
+        } else {
+            // 非 PlainSelect，直接转换
+            String selectStr = select.toString();
+            selectStr = convertPostgresqlFunctions(selectStr);
+            sb.append(selectStr).append(";\n\n");
+        }
+        
+        return sb.toString();
     }
 
     /**
@@ -802,7 +1017,7 @@ public class PGToOracleVisitor extends StatementVisitorAdapter {
         if (sql == null) return "";
         String result = sql;
         // CURRENT_TIMESTAMP -> SYSDATE
-        result = result.replaceAll("(?i)\\bCURRENT_TIMESTAMP\\b", "SYSTIMESTAMP");
+        result = result.replaceAll("(?i)\\bCURRENT_TIMESTAMP\\b", "SYSDATE");
         // TO_TIMESTAMP -> TO_DATE
         result = result.replaceAll("(?i)\\bTO_TIMESTAMP\\s*\\(", "TO_DATE(");
         // COALESCE -> NVL
@@ -811,7 +1026,196 @@ public class PGToOracleVisitor extends StatementVisitorAdapter {
         result = result.replaceAll("(?i)\\bNOW\\s*\\(\\s*\\)", "SYSDATE");
         // 标识符处理：Oracle 使用双引号，去掉反引号
         result = result.replace("`", "\"");
+        
+        // INTERVAL 转换（PostgreSQL: INTERVAL '365 days'，Oracle: INTERVAL '365' DAY）
+        // 去掉引号中的单位，单位改为单数形式
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+years'", "INTERVAL '$1' YEAR");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+months'", "INTERVAL '$1' MONTH");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+days'", "INTERVAL '$1' DAY");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+hours'", "INTERVAL '$1' HOUR");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+minutes'", "INTERVAL '$1' MINUTE");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+seconds'", "INTERVAL '$1' SECOND");
+        // 也支持单数形式
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+year'", "INTERVAL '$1' YEAR");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+month'", "INTERVAL '$1' MONTH");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+day'", "INTERVAL '$1' DAY");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+hour'", "INTERVAL '$1' HOUR");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+minute'", "INTERVAL '$1' MINUTE");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)\\s+second'", "INTERVAL '$1' SECOND");
+        
         return result;
+    }
+
+    /**
+     * 转换表达式（处理 PostgreSQL 函数、INTERVAL、CURRENT_TIMESTAMP 等）
+     */
+    private String convertExpression(Expression expression) {
+        if (expression == null) return "";
+
+        if (expression instanceof StringValue) {
+            StringValue strVal = (StringValue) expression;
+            return "'" + strVal.getValue().replace("'", "''") + "'";
+        }
+        if (expression instanceof LongValue) {
+            LongValue longVal = (LongValue) expression;
+            return String.valueOf(longVal.getValue());
+        }
+        if (expression instanceof DoubleValue) {
+            DoubleValue doubleVal = (DoubleValue) expression;
+            return String.valueOf(doubleVal.getValue());
+        }
+        if (expression instanceof DateValue) {
+            DateValue dateVal = (DateValue) expression;
+            return "'" + dateVal.getValue() + "'";
+        }
+        if (expression instanceof Function) {
+            Function function = (Function) expression;
+            String functionName = function.getName();
+            List<Expression> params = new ArrayList<>();
+
+            ExpressionList exprList = function.getParameters();
+            if (exprList != null) {
+                params = exprList.getExpressions();
+            }
+
+            // 特殊处理 PostgreSQL 函数
+            if ("COALESCE".equalsIgnoreCase(functionName) && params != null && params.size() >= 2) {
+                return "NVL(" + convertExpression(params.get(0)) + ", " + convertExpression(params.get(1)) + ")";
+            } else if ("TO_TIMESTAMP".equalsIgnoreCase(functionName) && params != null && params.size() >= 1) {
+                // TO_TIMESTAMP -> TO_DATE
+                StringBuilder sb = new StringBuilder("TO_DATE(");
+                for (int i = 0; i < params.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(convertExpression(params.get(i)));
+                }
+                sb.append(")");
+                return sb.toString();
+            }
+
+            // 其他函数
+            StringBuilder funcCall = new StringBuilder(functionName).append("(");
+            if (params != null) {
+                for (int i = 0; i < params.size(); i++) {
+                    if (i > 0) funcCall.append(", ");
+                    funcCall.append(convertExpression(params.get(i)));
+                }
+            }
+            funcCall.append(")");
+            return funcCall.toString();
+        }
+        if (expression instanceof Column) {
+            Column column = (Column) expression;
+            return cleanIdentifier(column.getColumnName());
+        }
+
+        // 处理 IntervalExpression（INTERVAL '365 days'）
+        try {
+            // 检查是否是 IntervalExpression
+            if (expression.getClass().getSimpleName().contains("Interval")) {
+                String intervalStr = expression.toString();
+                // 使用 convertPostgresqlFunctions 处理 INTERVAL 转换
+                intervalStr = convertPostgresqlFunctions(intervalStr);
+                return intervalStr;
+            }
+        } catch (Exception ignore) {}
+
+        // 处理 TimeKeyExpression（CURRENT_TIMESTAMP）
+        try {
+            if (expression.getClass().getSimpleName().contains("TimeKey")) {
+                String timeStr = expression.toString();
+                // CURRENT_TIMESTAMP -> SYSDATE
+                timeStr = convertPostgresqlFunctions(timeStr);
+                return timeStr;
+            }
+        } catch (Exception ignore) {}
+
+        // 递归处理常见的表达式类型: 比如二元操作符等
+        try {
+            // 处理二元运算，如 AndExpression, EqualsTo 等
+            Method getLeft = expression.getClass().getMethod("getLeftExpression");
+            Method getRight = expression.getClass().getMethod("getRightExpression");
+            Object left = getLeft.invoke(expression);
+            Object right = getRight.invoke(expression);
+            String op = expression.getClass().getSimpleName();
+            String opStr;
+            // 还原运算符 (适用于大部分JSqlParser)
+            if (op.endsWith("AndExpression")) {
+                opStr = " AND ";
+            } else if (op.endsWith("OrExpression")) {
+                opStr = " OR ";
+            } else if (op.endsWith("EqualsTo")) {
+                opStr = " = ";
+            } else if (op.endsWith("NotEqualsTo")) {
+                opStr = " <> ";
+            } else if (op.endsWith("GreaterThan")) {
+                opStr = " > ";
+            } else if (op.endsWith("GreaterThanEquals")) {
+                opStr = " >= ";
+            } else if (op.endsWith("MinorThan")) {
+                opStr = " < ";
+            } else if (op.endsWith("MinorThanEquals")) {
+                opStr = " <= ";
+            } else if (op.endsWith("LikeExpression")) {
+                opStr = " LIKE ";
+            } else if (op.endsWith("InExpression")) {
+                opStr = " IN ";
+            } else if (op.contains("Subtraction") || op.contains("Minus")) {
+                // 减法运算符
+                opStr = " - ";
+            } else if (op.contains("Addition") || op.contains("Plus")) {
+                // 加法运算符
+                opStr = " + ";
+            } else if (op.contains("Multiplication")) {
+                // 乘法运算符
+                opStr = " * ";
+            } else if (op.contains("Division")) {
+                // 除法运算符
+                opStr = " / ";
+            } else if (op.endsWith("IsNullExpression")) {
+                // IS NULL/IS NOT NULL表达式
+                boolean not = false;
+                try {
+                    not = (boolean) expression.getClass().getMethod("isNot").invoke(expression);
+                } catch (Exception ignore) {}
+                return convertExpression((Expression) left) + (not ? " IS NOT NULL" : " IS NULL");
+            } else {
+                opStr = " " + op.replaceAll("Expression$", "") + " ";
+            }
+            return convertExpression((Expression) left) + opStr + convertExpression((Expression) right);
+        } catch (Exception ignore) {}
+
+        // 尝试括号表达式
+        try {
+            Method getExpr = expression.getClass().getMethod("getExpression");
+            Object exprObj = getExpr.invoke(expression);
+            return "(" + convertExpression((Expression) exprObj) + ")";
+        } catch (Exception ignore) {}
+
+        // 处理IN (xxx, yyy)结构
+        try {
+            Method getLeft = expression.getClass().getMethod("getLeftExpression");
+            Object left = getLeft.invoke(expression);
+            Method getRightItems = expression.getClass().getMethod("getRightItemsList");
+            Object rightItems = getRightItems.invoke(expression);
+            if (rightItems instanceof ExpressionList) {
+                @SuppressWarnings("unchecked")
+                List<Expression> exprs = ((ExpressionList) rightItems).getExpressions();
+                StringBuilder sb = new StringBuilder();
+                sb.append(convertExpression((Expression) left)).append(" IN (");
+                for (int i = 0; i < exprs.size(); i++) {
+                    if (i != 0) sb.append(", ");
+                    sb.append(convertExpression(exprs.get(i)));
+                }
+                sb.append(")");
+                return sb.toString();
+            }
+        } catch (Exception ignore) {}
+
+        // 其他表达式 fallback
+        // 先使用 convertPostgresqlFunctions 处理 INTERVAL 和 CURRENT_TIMESTAMP
+        String exprStr = expression.toString();
+        exprStr = convertPostgresqlFunctions(exprStr);
+        return exprStr;
     }
 
     /**

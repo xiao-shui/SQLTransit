@@ -10,6 +10,8 @@ import net.sf.jsqlparser.statement.delete.Delete;
 import net.sf.jsqlparser.statement.update.Update;
 import net.sf.jsqlparser.statement.alter.Alter;
 import net.sf.jsqlparser.statement.alter.AlterExpression;
+import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.schema.Column;
 import net.sf.jsqlparser.schema.Table;
@@ -49,13 +51,24 @@ public class MysqlToPGVisitor extends StatementVisitorAdapter {
 
     // 工具方法：处理MySQL特定的函数和语法
     private String convertMysqlFunctions(String sql) {
+        if (sql == null) return "";
         String result = sql;
 
         // 函数转换
+        // CURRENT_TIMESTAMP 和 NOW() 在 PostgreSQL 中效果完全一致，统一使用 CURRENT_TIMESTAMP
         result = result.replaceAll("(?i)CURRENT_TIMESTAMP\\(\\)", "CURRENT_TIMESTAMP");
-        result = result.replaceAll("(?i)NOW\\(\\)", "CURRENT_TIMESTAMP");
+        result = result.replaceAll("(?i)\\bNOW\\s*\\(\\s*\\)", "CURRENT_TIMESTAMP");
         result = result.replaceAll("(?i)\\bIFNULL\\(", "COALESCE(");
         result = result.replaceAll("(?i)\\bISNULL\\(", "COALESCE(");
+
+        // INTERVAL 转换（MySQL: INTERVAL 1 YEAR，PostgreSQL: INTERVAL '1 YEAR'）
+        // 需要先处理 INTERVAL，因为数值需要加引号
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+YEAR", "INTERVAL '$1 YEAR'");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+MONTH", "INTERVAL '$1 MONTH'");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+DAY", "INTERVAL '$1 DAY'");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+HOUR", "INTERVAL '$1 HOUR'");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+MINUTE", "INTERVAL '$1 MINUTE'");
+        result = result.replaceAll("(?i)INTERVAL\\s+(\\d+)\\s+SECOND", "INTERVAL '$1 SECOND'");
 
         // 替换LIMIT语法（需要更复杂的处理）
         result = result.replaceAll("(?i)LIMIT\\s+(\\d+)\\s*,\\s*(\\d+)", "LIMIT $2 OFFSET $1");
@@ -82,15 +95,6 @@ public class MysqlToPGVisitor extends StatementVisitorAdapter {
         }
         return String.join(", ", result);
     }
-
-    // 工具方法：处理 WHERE 条件表达式
-    private String processWhereExpression(Expression where) {
-        if (where == null) return "";
-        String expr = where.toString();
-        expr = convertMysqlFunctions(expr);
-        return " WHERE " + expr;
-    }
-
 
     // 工具方法：提取表的注释
     private String extractTableComment(CreateTable createTable) {
@@ -1092,48 +1096,136 @@ public class MysqlToPGVisitor extends StatementVisitorAdapter {
     @Override
     public void visit(Insert insert) {
         String tableName = getFullTableName(insert.getTable());
-        postgresqlSql.append("INSERT INTO ").append(tableName);
-
         List<Column> columns = insert.getColumns();
+        
+        // 生成列名部分（如果有）
+        StringBuilder columnPart = new StringBuilder();
         if (columns != null && !columns.isEmpty()) {
-            postgresqlSql.append("(");
+            columnPart.append(" (");
             for (int i = 0; i < columns.size(); i++) {
                 String colName = cleanIdentifier(columns.get(i).getColumnName());
-                postgresqlSql.append(colName);
-                if (i < columns.size() - 1) postgresqlSql.append(", ");
+                columnPart.append(colName);
+                if (i < columns.size() - 1) columnPart.append(", ");
             }
-            postgresqlSql.append(")");
+            columnPart.append(")");
         }
 
-        // 获取VALUES部分并转换
-        String valuesStr = insert.toString();
-        int valuesIdx = valuesStr.toUpperCase().indexOf("VALUES");
-        String valuesPart = "";
+        // 尝试从 Insert 对象获取 Values
+        try {
+            Method getValuesMethod = Insert.class.getMethod("getValues");
+            Object valuesObj = getValuesMethod.invoke(insert);
+            
+            if (valuesObj != null) {
+                // 处理 ExpressionList（单行或多行，PostgreSQL 支持多值插入，保持原格式）
+                String valuesStr = convertInsertValues(valuesObj);
+                postgresqlSql.append("INSERT INTO ").append(tableName).append(columnPart);
+                postgresqlSql.append(" VALUES").append(valuesStr).append(";\n\n");
+                return;
+            }
+        } catch (Exception e) {
+            // 如果反射失败，从 toString() 解析
+        }
+        
+        // 回退：从 toString() 解析
+        String insertStr = insert.toString();
+        int valuesIdx = insertStr.toUpperCase().indexOf("VALUES");
         if (valuesIdx != -1) {
-            valuesPart = valuesStr.substring(valuesIdx + 6);
+            String valuesPart = insertStr.substring(valuesIdx + 6).trim();
             valuesPart = convertMysqlFunctions(valuesPart);
+            postgresqlSql.append("INSERT INTO ").append(tableName).append(columnPart);
+            postgresqlSql.append(" VALUES ").append(valuesPart);
+        } else {
+            postgresqlSql.append("INSERT INTO ").append(tableName).append(columnPart);
         }
 
-        postgresqlSql.append(" VALUES").append(valuesPart).append(";\n\n");
+        postgresqlSql.append(";\n\n");
+    }
+    
+    // 辅助方法：转换 INSERT VALUES
+    private String convertInsertValues(Object valuesObj) {
+        if (valuesObj == null) return "";
+        
+        try {
+            // 尝试获取 getExpressions() 方法
+            Method getExprsMethod = valuesObj.getClass().getMethod("getExpressions");
+            Object exprsObj = getExprsMethod.invoke(valuesObj);
+            
+            if (exprsObj instanceof List) {
+                @SuppressWarnings("unchecked")
+                List<Expression> expressions = (List<Expression>) exprsObj;
+                StringBuilder sb = new StringBuilder();
+                
+                // 检查是否是多行插入（第一个元素以括号开头）
+                if (!expressions.isEmpty() && expressions.get(0).toString().trim().startsWith("(")) {
+                    // 多行插入：('Bob', 'bob@example.com'), ('Charlie', 'charlie@example.com')
+                    for (int i = 0; i < expressions.size(); i++) {
+                        if (i > 0) sb.append(", ");
+                        String exprStr = expressions.get(i).toString();
+                        exprStr = convertMysqlFunctions(exprStr);
+                        sb.append(exprStr);
+                    }
+                } else {
+                    // 单行插入：('Alice', 'alice@example.com')
+                    sb.append("(");
+                    for (int i = 0; i < expressions.size(); i++) {
+                        if (i > 0) sb.append(", ");
+                        String exprStr = expressions.get(i).toString();
+                        exprStr = convertMysqlFunctions(exprStr);
+                        sb.append(exprStr);
+                    }
+                    sb.append(")");
+                }
+                
+                return sb.toString();
+            }
+        } catch (Exception e) {
+            // 如果解析失败，使用 toString()
+            String valuesStr = valuesObj.toString();
+            valuesStr = convertMysqlFunctions(valuesStr);
+            return valuesStr;
+        }
+        
+        return "";
     }
 
     // 处理 UPDATE
     @Override
+    @SuppressWarnings("deprecation")
     public void visit(Update update) {
         String tableName = getFullTableName(update.getTable());
         postgresqlSql.append("UPDATE ").append(tableName).append(" SET ");
 
         List<Column> cols = update.getColumns();
-        List<Expression> exprs = update.getExpressions();
+        @SuppressWarnings("unchecked")
+        List<Expression> exprs = (List<Expression>) (List<?>) update.getExpressions();
+        
         for (int i = 0; i < cols.size(); i++) {
             String colName = cleanIdentifier(cols.get(i).getColumnName());
-            String valueExpr = exprs.get(i).toString();
-            valueExpr = convertMysqlFunctions(valueExpr);
-            postgresqlSql.append(colName).append("=").append(valueExpr);
+            Expression expr = exprs.get(i);
+            String valueExpr = convertExpression(expr);
+            postgresqlSql.append(colName).append(" = ").append(valueExpr);
             if (i < cols.size() - 1) postgresqlSql.append(", ");
         }
 
-        postgresqlSql.append(processWhereExpression(update.getWhere())).append(";\n\n");
+        Expression where = update.getWhere();
+        if (where != null) {
+            String whereStr = convertExpression(where);
+            postgresqlSql.append(" WHERE ").append(whereStr);
+        }
+
+        postgresqlSql.append(";\n\n");
+    }
+
+    // 辅助方法：转换表达式（处理 MySQL 函数等，PostgreSQL 不需要转换布尔值和列名大小写）
+    private String convertExpression(Expression expr) {
+        if (expr == null) return "";
+        
+        String exprStr = expr.toString();
+        
+        // 转换 MySQL 函数为 PostgreSQL 函数
+        exprStr = convertMysqlFunctions(exprStr);
+        
+        return exprStr;
     }
 
     // 处理 DELETE
@@ -1141,7 +1233,84 @@ public class MysqlToPGVisitor extends StatementVisitorAdapter {
     public void visit(Delete delete) {
         String tableName = getFullTableName(delete.getTable());
         postgresqlSql.append("DELETE FROM ").append(tableName);
-        postgresqlSql.append(processWhereExpression(delete.getWhere())).append(";\n\n");
+        
+        Expression where = delete.getWhere();
+        if (where != null) {
+            String whereStr = convertExpression(where);
+            postgresqlSql.append(" WHERE ").append(whereStr);
+        }
+        
+        postgresqlSql.append(";\n\n");
+    }
+
+    // 处理 SELECT
+    @Override
+    @SuppressWarnings("deprecation")
+    public void visit(Select select) {
+        if (select.getSelectBody() instanceof PlainSelect) {
+            PlainSelect plainSelect = (PlainSelect) select.getSelectBody();
+            
+            // 处理 SELECT 列表
+            postgresqlSql.append("SELECT ");
+            if (plainSelect.getSelectItems() != null) {
+                boolean first = true;
+                for (Object item : plainSelect.getSelectItems()) {
+                    if (!first) postgresqlSql.append(", ");
+                    String itemStr = item.toString();
+                    itemStr = convertMysqlFunctions(itemStr);
+                    postgresqlSql.append(itemStr);
+                    first = false;
+                }
+            } else {
+                postgresqlSql.append("*");
+            }
+            
+            // 处理 FROM
+            if (plainSelect.getFromItem() != null) {
+                String fromStr = plainSelect.getFromItem().toString();
+                // 转换表名，保留 schema
+                if (plainSelect.getFromItem() instanceof Table) {
+                    Table table = (Table) plainSelect.getFromItem();
+                    fromStr = getFullTableName(table);
+                } else {
+                    fromStr = convertMysqlFunctions(fromStr);
+                }
+                postgresqlSql.append(" FROM ").append(fromStr);
+            }
+            
+            // 处理 WHERE
+            if (plainSelect.getWhere() != null) {
+                String whereStr = convertExpression(plainSelect.getWhere());
+                postgresqlSql.append(" WHERE ").append(whereStr);
+            }
+            
+            // 处理 ORDER BY
+            if (plainSelect.getOrderByElements() != null) {
+                postgresqlSql.append(" ORDER BY ");
+                boolean first = true;
+                for (Object orderElem : plainSelect.getOrderByElements()) {
+                    if (!first) postgresqlSql.append(", ");
+                    String orderStr = orderElem.toString();
+                    orderStr = convertMysqlFunctions(orderStr);
+                    postgresqlSql.append(orderStr);
+                    first = false;
+                }
+            }
+            
+            // 处理 LIMIT（PostgreSQL 的 LIMIT 语法和 MySQL 相同，不需要转换）
+            if (plainSelect.getLimit() != null) {
+                String limitStr = plainSelect.getLimit().toString();
+                limitStr = convertMysqlFunctions(limitStr);
+                postgresqlSql.append(" ").append(limitStr);
+            }
+            
+            postgresqlSql.append(";\n\n");
+        } else {
+            // 非 PlainSelect，直接转换
+            String selectStr = select.toString();
+            selectStr = convertMysqlFunctions(selectStr);
+            postgresqlSql.append(selectStr).append(";\n\n");
+        }
     }
 
     // 获取最终 PostgreSQL SQL

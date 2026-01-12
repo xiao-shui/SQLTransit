@@ -20,6 +20,8 @@ import net.sf.jsqlparser.statement.delete.Delete;
 import net.sf.jsqlparser.statement.drop.Drop;
 import net.sf.jsqlparser.statement.insert.Insert;
 import net.sf.jsqlparser.statement.update.Update;
+import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.statement.select.PlainSelect;
 
 import java.lang.reflect.Method;
 import java.util.*;
@@ -380,8 +382,10 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
             // 处理默认值转换
             if (colInfo.defaultValue != null) {
                 if (colInfo.defaultValue.toUpperCase(Locale.ROOT).contains("SYSDATE") ||
-                        colInfo.defaultValue.toUpperCase(Locale.ROOT).contains("CURRENT_TIMESTAMP")) {
-                    colInfo.defaultValue = "CURRENT_TIMESTAMP";
+                        colInfo.defaultValue.toUpperCase(Locale.ROOT).contains("SYSTIMESTAMP")) {
+                    colInfo.defaultValue = "NOW()";
+                } else if (colInfo.defaultValue.toUpperCase(Locale.ROOT).contains("CURRENT_TIMESTAMP")) {
+                    colInfo.defaultValue = "NOW()";
                 } else if (colInfo.defaultValue.toUpperCase(Locale.ROOT).contains("NULL")) {
                     colInfo.defaultValue = "NULL";
                 }
@@ -810,16 +814,24 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         addRawSql(sql);
     }
 
+    @Override
+    @SuppressWarnings("deprecation")
+    public void visit(Select select) {
+        String sql = convertSelect(select);
+        addRawSql(sql);
+    }
+
     private String renderCreateTable(CreateTable createTable) {
         StringBuilder sb = new StringBuilder();
-        // 如果存在 schema，则保留 schema.table
+        // 保留 schema.table，如果存在 schema
+        String tableKey = cleanIdentifier(createTable.getTable().getName());
         String tableName = getFullTableName(createTable.getTable());
-        TableInfo tableInfo = tables.get(tableName);
+        TableInfo tableInfo = tables.get(tableKey);
         if (tableInfo == null || !tableInfo.hasTableDefinition) {
             return "";
         }
 
-        sb.append("CREATE TABLE ").append(tableInfo.tableName).append(" (\n");
+        sb.append("CREATE TABLE ").append(tableName).append(" (\n");
 
         // 判断是否是单字段主键
         boolean isSingleColumnPrimaryKey = tableInfo.primaryKeys.size() == 1;
@@ -986,6 +998,149 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         return sb.append(";\n\n").toString();
     }
 
+    private String convertSelect(Select select) {
+        StringBuilder sb = new StringBuilder();
+        
+        if (select.getSelectBody() instanceof PlainSelect) {
+            PlainSelect plainSelect = (PlainSelect) select.getSelectBody();
+            
+            // 处理 SELECT 列表
+            sb.append("SELECT ");
+            if (plainSelect.getSelectItems() != null) {
+                boolean first = true;
+                for (Object item : plainSelect.getSelectItems()) {
+                    if (!first) sb.append(", ");
+                    String itemStr = item.toString();
+                    itemStr = convertOracleFunctions(itemStr);
+                    sb.append(itemStr);
+                    first = false;
+                }
+            } else {
+                sb.append("*");
+            }
+            
+            // 处理 FROM
+            if (plainSelect.getFromItem() != null) {
+                String fromStr = plainSelect.getFromItem().toString();
+                // 转换表名，保留 schema
+                if (plainSelect.getFromItem() instanceof Table) {
+                    Table table = (Table) plainSelect.getFromItem();
+                    fromStr = getFullTableName(table);
+                } else {
+                    fromStr = convertOracleFunctions(fromStr);
+                }
+                sb.append(" FROM ").append(fromStr);
+            }
+            
+            // 处理 WHERE
+            if (plainSelect.getWhere() != null) {
+                String whereStr = convertExpressionLowerColumn(plainSelect.getWhere());
+                sb.append(" WHERE ").append(whereStr);
+            }
+            
+            // 处理 ORDER BY
+            if (plainSelect.getOrderByElements() != null) {
+                sb.append(" ORDER BY ");
+                boolean first = true;
+                for (Object orderElem : plainSelect.getOrderByElements()) {
+                    if (!first) sb.append(", ");
+                    String orderStr = orderElem.toString();
+                    orderStr = convertOracleFunctions(orderStr);
+                    sb.append(orderStr);
+                    first = false;
+                }
+            }
+            
+            // 处理 Oracle 分页（FETCH FIRST ... ROWS ONLY 或 OFFSET ... ROWS FETCH NEXT ... ROWS ONLY）
+            // Oracle 使用 getFetch() 和 getOffset() 而不是 getLimit()
+            long offset = 0;
+            long rowCount = 0;
+            
+            // 获取 OFFSET（如果存在）
+            try {
+                Method getOffsetMethod = PlainSelect.class.getMethod("getOffset");
+                Object offsetObj = getOffsetMethod.invoke(plainSelect);
+                if (offsetObj != null) {
+                    // Offset 对象有 getOffset() 方法返回 LongValue
+                    try {
+                        Method getOffsetValueMethod = offsetObj.getClass().getMethod("getOffset");
+                        Object offsetValue = getOffsetValueMethod.invoke(offsetObj);
+                        if (offsetValue instanceof LongValue) {
+                            offset = ((LongValue) offsetValue).getValue();
+                        } else if (offsetValue instanceof Long) {
+                            offset = (Long) offsetValue;
+                        } else if (offsetValue != null) {
+                            offset = Long.parseLong(offsetValue.toString());
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从 toString() 解析
+                        String offsetStr = offsetObj.toString();
+                        Pattern offsetPattern = Pattern.compile("(?i)OFFSET\\s+(\\d+)\\s+ROWS?", Pattern.CASE_INSENSITIVE);
+                        Matcher m = offsetPattern.matcher(offsetStr);
+                        if (m.find()) {
+                            offset = Long.parseLong(m.group(1));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // getOffset() 方法不存在或失败，忽略
+            }
+            
+            // 获取 FETCH（如果存在）
+            try {
+                Method getFetchMethod = PlainSelect.class.getMethod("getFetch");
+                Object fetchObj = getFetchMethod.invoke(plainSelect);
+                if (fetchObj != null) {
+                    // Fetch 对象有 getExpression() 方法返回 LongValue
+                    try {
+                        Method getExpressionMethod = fetchObj.getClass().getMethod("getExpression");
+                        Object exprObj = getExpressionMethod.invoke(fetchObj);
+                        if (exprObj instanceof LongValue) {
+                            rowCount = ((LongValue) exprObj).getValue();
+                        } else if (exprObj instanceof Long) {
+                            rowCount = (Long) exprObj;
+                        } else if (exprObj != null) {
+                            rowCount = Long.parseLong(exprObj.toString());
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从 toString() 解析
+                        String fetchStr = fetchObj.toString();
+                        Pattern fetchPattern = Pattern.compile("(?i)FETCH\\s+(?:FIRST|NEXT)\\s+(\\d+)\\s+ROWS\\s+ONLY", Pattern.CASE_INSENSITIVE);
+                        Matcher m = fetchPattern.matcher(fetchStr);
+                        if (m.find()) {
+                            rowCount = Long.parseLong(m.group(1));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // getFetch() 方法不存在或失败，忽略
+            }
+            
+            // 如果有分页信息，生成 MySQL 的 LIMIT 语句
+            if (rowCount > 0) {
+                if (offset > 0) {
+                    // MySQL: LIMIT offset, rowCount (注意：MySQL 的 LIMIT 语法是 offset, count)
+                    sb.append(" LIMIT ").append(offset).append(", ").append(rowCount);
+                } else {
+                    // MySQL: LIMIT rowCount
+                    sb.append(" LIMIT ").append(rowCount);
+                }
+            } else if (offset > 0) {
+                // 只有 OFFSET 没有 FETCH，这种情况不太常见，但也要处理
+                sb.append(" LIMIT ").append(offset).append(", 18446744073709551615"); // MySQL 的最大值
+            }
+            
+            sb.append(";\n\n");
+        } else {
+            // 非 PlainSelect，直接转换
+            String selectStr = select.toString();
+            selectStr = convertOracleFunctions(selectStr);
+            sb.append(selectStr).append(";\n\n");
+        }
+        
+        return sb.toString();
+    }
+
     /**
      * where后的表达式内容列名全部小写
      */
@@ -1018,12 +1173,18 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                 params = exprList.getExpressions();
             }
 
-            // 特殊处理TO_DATE函数
+            // 特殊处理 Oracle 函数
             if ("TO_DATE".equalsIgnoreCase(functionName) && params != null && params.size() >= 2) {
                 String dateStr = params.get(0).toString();
                 String oracleFormat = params.get(1).toString().replaceAll("['\"]", "");
                 String mysqlFormat = convertDateFormat(oracleFormat);
                 return "STR_TO_DATE(" + dateStr + ", " + mysqlFormat + ")";
+            } else if ("SYSDATE".equalsIgnoreCase(functionName)) {
+                return "NOW()";
+            } else if ("SYSTIMESTAMP".equalsIgnoreCase(functionName)) {
+                return "NOW()";
+            } else if ("NVL".equalsIgnoreCase(functionName) && params != null && params.size() == 2) {
+                return "IFNULL(" + convertExpressionLowerColumn(params.get(0)) + ", " + convertExpressionLowerColumn(params.get(1)) + ")";
             }
 
             // 其他函数
@@ -1039,8 +1200,24 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         }
         if (expression instanceof Column) {
             Column column = (Column) expression;
-            return cleanIdentifier(column.getColumnName());
+            String colName = column.getColumnName();
+            // 特殊处理：SYSDATE 被解析为 Column 而不是 Function
+            if ("SYSDATE".equalsIgnoreCase(colName) || "SYSTIMESTAMP".equalsIgnoreCase(colName)) {
+                return "NOW()";
+            }
+            return cleanIdentifier(colName);
         }
+
+        // 处理 IntervalExpression（INTERVAL '365' DAY）
+        try {
+            // 检查是否是 IntervalExpression
+            if (expression.getClass().getSimpleName().contains("Interval")) {
+                String intervalStr = expression.toString();
+                // 使用 convertOracleFunctions 处理 INTERVAL 转换（去掉引号）
+                intervalStr = convertOracleFunctions(intervalStr);
+                return intervalStr;
+            }
+        } catch (Exception ignore) {}
 
         // 递归处理常见的表达式类型: 比如二元操作符等
         // 通过反射简化处理（如 left/right/operand/expressions），否则处理toString
@@ -1073,6 +1250,18 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                 opStr = " LIKE ";
             } else if (op.endsWith("InExpression")) {
                 opStr = " IN ";
+            } else if (op.contains("Subtraction") || op.contains("Minus")) {
+                // 减法运算符
+                opStr = " - ";
+            } else if (op.contains("Addition") || op.contains("Plus")) {
+                // 加法运算符
+                opStr = " + ";
+            } else if (op.contains("Multiplication")) {
+                // 乘法运算符
+                opStr = " * ";
+            } else if (op.contains("Division")) {
+                // 除法运算符
+                opStr = " / ";
             } else if (op.endsWith("IsNullExpression")) {
                 // IS NULL/IS NOT NULL表达式
                 boolean not = false;
@@ -1114,15 +1303,24 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         } catch (Exception ignore) {}
 
         // 其他表达式 fallback
-        // 尝试替换 identifier/列名为小写，提升兼容性
+        // 先使用 convertOracleFunctions 处理 SYSDATE 和 INTERVAL
         String exprStr = expression.toString();
+        exprStr = convertOracleFunctions(exprStr);
+        
+        // 尝试替换 identifier/列名为小写，提升兼容性
         // 用正则尽可能替换列名，仅替换未加引号、未作函数调用的写法, 不影响其他标识符
         // Java 8 前 Matcher 没有传入 lambda 的方法，因此需要自己用StringBuffer实现替换
         Pattern colNamePattern = Pattern.compile("([a-zA-Z_][a-zA-Z_0-9]*)");
         Matcher matcher = colNamePattern.matcher(exprStr);
         StringBuffer sb = new StringBuffer();
         while (matcher.find()) {
-            matcher.appendReplacement(sb, matcher.group(1).toLowerCase());
+            String matched = matcher.group(1);
+            // 跳过已经是 NOW() 的情况
+            if (!matched.equalsIgnoreCase("NOW")) {
+                matcher.appendReplacement(sb, matched.toLowerCase());
+            } else {
+                matcher.appendReplacement(sb, matched);
+            }
         }
         matcher.appendTail(sb);
         exprStr = sb.toString();
@@ -1158,12 +1356,18 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
                 params = exprList.getExpressions();
             }
 
-            // 特殊处理TO_DATE函数
+            // 特殊处理 Oracle 函数
             if ("TO_DATE".equalsIgnoreCase(functionName) && params != null && params.size() >= 2) {
                 String dateStr = params.get(0).toString();
                 String oracleFormat = params.get(1).toString().replaceAll("['\"]", "");
                 String mysqlFormat = convertDateFormat(oracleFormat);
                 return "STR_TO_DATE(" + dateStr + ", " + mysqlFormat + ")";
+            } else if ("SYSDATE".equalsIgnoreCase(functionName)) {
+                return "NOW()";
+            } else if ("SYSTIMESTAMP".equalsIgnoreCase(functionName)) {
+                return "NOW()";
+            } else if ("NVL".equalsIgnoreCase(functionName) && params != null && params.size() == 2) {
+                return "IFNULL(" + convertExpression(params.get(0)) + ", " + convertExpression(params.get(1)) + ")";
             }
 
             // 其他函数
@@ -1179,11 +1383,54 @@ public class OracleToMysqlVisitor extends StatementVisitorAdapter {
         }
         if (expression instanceof Column) {
             Column column = (Column) expression;
-            return cleanIdentifier(column.getColumnName());
+            String colName = column.getColumnName();
+            // 特殊处理：SYSDATE 被解析为 Column 而不是 Function
+            if ("SYSDATE".equalsIgnoreCase(colName) || "SYSTIMESTAMP".equalsIgnoreCase(colName)) {
+                return "NOW()";
+            }
+            return cleanIdentifier(colName);
         }
 
+        // 处理 IntervalExpression（INTERVAL '365' DAY）
+        try {
+            // 检查是否是 IntervalExpression
+            if (expression.getClass().getSimpleName().contains("Interval")) {
+                String intervalStr = expression.toString();
+                // 使用 convertOracleFunctions 处理 INTERVAL 转换（去掉引号）
+                intervalStr = convertOracleFunctions(intervalStr);
+                return intervalStr;
+            }
+        } catch (Exception ignore) {}
+
         // 处理其他表达式类型...
-        return expression.toString();
+        String exprStr = expression.toString();
+        // 使用 convertOracleFunctions 处理 SYSDATE 和 INTERVAL
+        exprStr = convertOracleFunctions(exprStr);
+        return exprStr;
+    }
+
+    // 工具方法：转换 Oracle 函数为 MySQL 函数
+    private String convertOracleFunctions(String sql) {
+        if (sql == null) return "";
+        String result = sql;
+        
+        // SYSDATE -> NOW()
+        result = result.replaceAll("(?i)\\bSYSDATE\\b", "NOW()");
+        // SYSTIMESTAMP -> NOW()
+        result = result.replaceAll("(?i)\\bSYSTIMESTAMP\\b", "NOW()");
+        // NVL -> IFNULL
+        result = result.replaceAll("(?i)\\bNVL\\s*\\(", "IFNULL(");
+        
+        // INTERVAL 转换（Oracle: INTERVAL '365' DAY，MySQL: INTERVAL 365 DAY）
+        // 去掉 INTERVAL 中数值的引号
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+YEAR", "INTERVAL $1 YEAR");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+MONTH", "INTERVAL $1 MONTH");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+DAY", "INTERVAL $1 DAY");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+HOUR", "INTERVAL $1 HOUR");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+MINUTE", "INTERVAL $1 MINUTE");
+        result = result.replaceAll("(?i)INTERVAL\\s+'([^']+)'\\s+SECOND", "INTERVAL $1 SECOND");
+        
+        return result;
     }
 
     private String convertDateFormat(String oracleFormat) {

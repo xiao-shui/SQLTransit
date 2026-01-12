@@ -9,6 +9,9 @@ import java.util.regex.Matcher;
  */
 public class GDBPosProcess {
 
+    // 分片列，通过静态变量配置，默认 g1,g2
+    public static String SHARD_COLUMNS = "g1,g2";
+
     /**
      * 后处理 GoldenDB SQL，添加缺失的分片配置
      *
@@ -30,7 +33,8 @@ public class GDBPosProcess {
 
     /**
      * 为 CREATE TABLE 语句添加分片配置（如果缺失）
-     * 分片配置格式：DISTRIBUTED BY HASH(主键列);
+     * 分片配置格式：DISTRIBUTED BY DUPLICATE(g1,g2);
+     * 分片列由静态变量 SHARD_COLUMNS 提供
      * 应该添加在表定义的末尾，即 ENGINE=... 或 COMMENT='...' 之后
      */
     private static String addShardingConfig(String sql) {
@@ -234,20 +238,17 @@ public class GDBPosProcess {
 
     /**
      * 构建分片配置子句
-     * 格式：DISTRIBUTED BY HASH(主键列)
-     * 如果没有主键，使用 DUPLICATE 模式
+     * 格式：DISTRIBUTED BY DUPLICATE(g1,g2)
+     * 分片列来自静态变量 SHARD_COLUMNS
      *
-     * @param primaryKey 主键列，多个列用逗号分隔，如果没有主键为 null
+     * @param primaryKey 主键列（当前不使用）
      * @return 分片配置子句
      */
     private static String buildShardingClause(String primaryKey) {
-        if (primaryKey != null && !primaryKey.trim().isEmpty()) {
-            // 有主键，使用 HASH 分片
-            return " DISTRIBUTED BY HASH(" + primaryKey + ")";
-        } else {
-            // 没有主键，使用 DUPLICATE 模式（全量复制）
-            return " ";
-        }
+        String cols = (SHARD_COLUMNS == null || SHARD_COLUMNS.trim().isEmpty())
+                ? ""
+                : SHARD_COLUMNS.trim();
+        return " DISTRIBUTED BY DUPLICATE(" + cols + ")";
     }
 
     /**
