@@ -307,6 +307,9 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
             case "DOUBLE":
                 return "NUMBER(32,0)";
             case "DECIMAL":
+                if (args != null && !args.isEmpty()) {
+                    return "NUMBER(" + args.get(0) + ","+ args.get(1)+")";
+                }
                 return "NUMBER";
             default:
                 if (args != null && !args.isEmpty()) {
@@ -889,7 +892,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         if (tableName == null) {
             tableName = "UNKNOWN_TABLE";
         }
-        
+
         // 先尝试从 AlterExpression 解析
         List<AlterExpression> expressions = null;
         try {
@@ -901,16 +904,378 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 expressions = alterExprs;
             }
         } catch (Exception e) {}
-        
+
+        boolean processed = false; // 标记是否成功处理了任何表达式
+
         if (expressions != null) {
             for (AlterExpression expr : expressions) {
                 if (expr == null) continue;
                 String opStr = expr.getOperation() != null ? expr.getOperation().toString().toUpperCase() : "";
+                
+                // 处理 ADD COLUMN、MODIFY COLUMN、CHANGE COLUMN 等涉及数据类型的操作
+                if ("ADD".equals(opStr) || "MODIFY".equals(opStr) || "CHANGE".equals(opStr)) {
+                    // 尝试通过反射获取getColDataTypeList
+                    try {
+                        Method getColDataTypeListMethod = expr.getClass().getMethod("getColDataTypeList");
+                        Object colDataTypeListObj = getColDataTypeListMethod.invoke(expr);
+                        
+                        if (colDataTypeListObj instanceof List && !((List<?>) colDataTypeListObj).isEmpty()) {
+                            Object colDataTypeObj = ((List<?>) colDataTypeListObj).get(0);
+                            
+                            // 获取列名（从ColumnDataType的toString中提取，或通过反射）
+                            String colName = null;
+                            String colType = null;
+                            List<String> args = null;
+                            
+                            // 尝试获取ColDataType
+                            try {
+                                Method getColDataTypeMethod = colDataTypeObj.getClass().getMethod("getColDataType");
+                                Object colDataType = getColDataTypeMethod.invoke(colDataTypeObj);
+                                
+                                if (colDataType != null) {
+                                    // 获取数据类型名
+                                    Method getDataTypeMethod = colDataType.getClass().getMethod("getDataType");
+                                    Object dataTypeObj = getDataTypeMethod.invoke(colDataType);
+                                    if (dataTypeObj != null) {
+                                        colType = dataTypeObj.toString();
+                                    }
+                                    
+                                    // 获取参数
+                                    try {
+                                        Method getArgumentsMethod = colDataType.getClass().getMethod("getArgumentsStringList");
+                                        Object argsObj = getArgumentsMethod.invoke(colDataType);
+                                        if (argsObj instanceof List) {
+                                            @SuppressWarnings("unchecked")
+                                            List<String> argsList = (List<String>) argsObj;
+                                            args = argsList;
+                                        }
+                                    } catch (Exception e) {
+                                        // 忽略
+                                    }
+                                }
+                            } catch (Exception e) {
+                                // 忽略
+                            }
+                            
+                            // 从toString中提取列名和完整信息
+                            String colDataTypeStr = colDataTypeObj.toString();
+                            
+                            // 提取列名（第一个单词，在数据类型之前）
+                            Pattern colNamePattern = Pattern.compile("^\\s*([`'\"]?\\w+[`'\"]?)\\s+([A-Z_]+)", Pattern.CASE_INSENSITIVE);
+                            Matcher colNameMatcher = colNamePattern.matcher(colDataTypeStr);
+                            if (colNameMatcher.find()) {
+                                colName = cleanIdentifier(colNameMatcher.group(1));
+                                if (colType == null) {
+                                    colType = colNameMatcher.group(2).toUpperCase();
+                                }
+                            }
+                            
+                            // 如果无法从模式匹配获取，尝试从字符串解析
+                            if (colName == null) {
+                                String[] parts = colDataTypeStr.trim().split("\\s+");
+                                if (parts.length > 0) {
+                                    colName = cleanIdentifier(parts[0]);
+                                }
+                            }
+                            
+                            // 转换数据类型
+                            if (colType != null && colName != null) {
+                                String oracleType = convertColumnType(colType, args);
+                                
+                                StringBuilder sb = new StringBuilder();
+                                sb.append("ALTER TABLE ").append(tableName).append(" ");
+                                
+                                if ("ADD".equals(opStr)) {
+                                    sb.append("ADD ");
+                                } else if ("MODIFY".equals(opStr)) {
+                                    sb.append("MODIFY ");
+                                } else if ("CHANGE".equals(opStr)) {
+                                    // CHANGE COLUMN old_name new_name TYPE
+                                    sb.append("MODIFY "); // Oracle使用MODIFY而不是CHANGE
+                                }
+                                
+                                sb.append(colName).append(" ").append(oracleType);
+                                
+                                // 处理列规格（从getColumnSpecs获取）
+                                try {
+                                    Method getColumnSpecsMethod = colDataTypeObj.getClass().getMethod("getColumnSpecs");
+                                    Object specsObj = getColumnSpecsMethod.invoke(colDataTypeObj);
+                                    if (specsObj instanceof List) {
+                                        List<String> specs = new ArrayList<>();
+                                        for (Object spec : (List<?>) specsObj) {
+                                            if (spec != null) {
+                                                specs.add(spec.toString().trim());
+                                            }
+                                        }
+                                        
+                                        // 解析约束
+                                        boolean isNotNull = false;
+                                        String defaultVal = null;
+                                        String comment = null;
+                                        
+                                        for (int i = 0; i < specs.size(); i++) {
+                                            String spec = specs.get(i).toUpperCase().trim();
+                                            
+                                            // 检查两词组合
+                                            if (i + 1 < specs.size()) {
+                                                String twoWordSpec = spec + " " + specs.get(i + 1).toUpperCase().trim();
+                                                if ("NOT NULL".equals(twoWordSpec)) {
+                                                    isNotNull = true;
+                                                    i++; // 跳过NULL
+                                                    continue;
+                                                }
+                                                if ("COMMENT".equals(spec) && i + 1 < specs.size()) {
+                                                    comment = specs.get(i + 1);
+                                                    i++; // 跳过注释内容
+                                                    continue;
+                                                }
+                                            }
+                                            
+                                            // 检查单词约束
+                                            if ("DEFAULT".equals(spec) && i + 1 < specs.size()) {
+                                                defaultVal = specs.get(i + 1);
+                                                i++; // 跳过默认值
+                                            } else if ("NOT".equals(spec) && i + 1 < specs.size() && "NULL".equals(specs.get(i + 1).toUpperCase().trim())) {
+                                                isNotNull = true;
+                                                i++; // 跳过NULL
+                                            }
+                                        }
+                                        
+                                        // 添加约束
+                                        if (defaultVal != null && !"NULL".equalsIgnoreCase(defaultVal)) {
+                                            sb.append(" DEFAULT ").append(defaultVal);
+                                        }
+                                        if (isNotNull) {
+                                            sb.append(" NOT NULL");
+                                        }
+                                        
+                                        // 处理注释（Oracle使用COMMENT ON语句）
+                                        if (comment != null && !comment.isEmpty()) {
+                                            // 移除可能的引号
+                                            comment = comment.replaceAll("^['\"]|['\"]$", "");
+                                            comments.add("COMMENT ON COLUMN " + tableName + "." + colName +
+                                                    " IS '" + comment.replace("'", "''") + "';\n");
+                                        }
+                                    }
+                                } catch (Exception e) {
+                                    // 如果无法获取列规格，尝试从字符串解析
+                                    if (colDataTypeStr.toUpperCase().contains("NOT NULL")) {
+                                        sb.append(" NOT NULL");
+                                    }
+                                    Pattern defaultPattern = Pattern.compile("(?i)DEFAULT\\s+([^\\s]+(?:\\s+[^\\s]+)*?)(?=\\s+(?:NOT|NULL|COMMENT|,|$))");
+                                    Matcher defaultMatcher = defaultPattern.matcher(colDataTypeStr);
+                                    if (defaultMatcher.find()) {
+                                        String defaultVal = defaultMatcher.group(1).trim();
+                                        if (!"NULL".equalsIgnoreCase(defaultVal)) {
+                                            sb.append(" DEFAULT ").append(defaultVal);
+                                        }
+                                    }
+                                }
+                                
+                                sb.append(";\n\n");
+                                oracleSql.append(sb.toString());
+                                
+                                // 添加注释语句
+                                if (!comments.isEmpty()) {
+                                    for (String cmt : comments) {
+                                        oracleSql.append(cmt);
+                                    }
+                                    comments.clear();
+                                }
+                                
+                                processed = true;
+                                continue;
+                            }
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从toString()解析
+                    }
+                    
+                    // 回退：尝试通过反射获取ColumnDefinition
+                    ColumnDefinition colDef = null;
+                    try {
+                        Method getColDefMethod = expr.getClass().getMethod("getColumnDefinition");
+                        Object colDefObj = getColDefMethod.invoke(expr);
+                        if (colDefObj instanceof ColumnDefinition) {
+                            colDef = (ColumnDefinition) colDefObj;
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从toString()解析
+                    }
+                    
+                    if (colDef != null) {
+                        String colName = cleanIdentifier(colDef.getColumnName());
+                        String colType = convertColumnType(colDef.getColDataType().getDataType(),
+                                colDef.getColDataType().getArgumentsStringList());
+                        
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("ALTER TABLE ").append(tableName).append(" ");
+                        
+                        if ("ADD".equals(opStr)) {
+                            sb.append("ADD ");
+                        } else if ("MODIFY".equals(opStr)) {
+                            sb.append("MODIFY ");
+                        } else if ("CHANGE".equals(opStr)) {
+                            // CHANGE COLUMN old_name new_name TYPE
+                            sb.append("MODIFY "); // Oracle使用MODIFY而不是CHANGE
+                        }
+                        
+                        sb.append(colName).append(" ").append(colType).append(" ");
+                        
+                        // 处理列约束（NOT NULL, DEFAULT等）
+                        String colStr = colDef.toString();
+                        if (colStr.toUpperCase().contains("NOT NULL")) {
+                            sb.append(" NOT NULL");
+                        }
+                        if (colStr.toUpperCase().contains("DEFAULT")) {
+                            Pattern defaultPattern = Pattern.compile("(?i)DEFAULT\\s+([^\\s]+(?:\\s+[^\\s]+)*?)(?=\\s+(?:NOT|NULL|,|$))");
+                            Matcher defaultMatcher = defaultPattern.matcher(colStr);
+                            if (defaultMatcher.find()) {
+                                String defaultVal = defaultMatcher.group(1).trim();
+                                if (!"NULL".equalsIgnoreCase(defaultVal)) {
+                                    sb.append(" DEFAULT ").append(defaultVal);
+                                }
+                            }
+                        }
+                        
+                        sb.append(";\n\n");
+                        oracleSql.append(sb.toString());
+                        processed = true;
+                        continue;
+                    }
+                }
+                
+                // 处理 ALTER COLUMN ... SET DEFAULT
+                if ("ALTER".equals(opStr)) {
+                    try {
+                        Method getColDataTypeListMethod = expr.getClass().getMethod("getColDataTypeList");
+                        Object colDataTypeListObj = getColDataTypeListMethod.invoke(expr);
+                        
+                        if (colDataTypeListObj instanceof List && !((List<?>) colDataTypeListObj).isEmpty()) {
+                            Object colDataTypeObj = ((List<?>) colDataTypeListObj).get(0);
+                            String colDataTypeStr = colDataTypeObj.toString();
+                            
+                            // 提取列名（第一个单词）
+                            Pattern colNamePattern = Pattern.compile("^\\s*([`'\"]?\\w+[`'\"]?)\\s+", Pattern.CASE_INSENSITIVE);
+                            Matcher colNameMatcher = colNamePattern.matcher(colDataTypeStr);
+                            if (colNameMatcher.find()) {
+                                String colName = cleanIdentifier(colNameMatcher.group(1));
+                                
+                                // 提取SET DEFAULT值
+                                Pattern setDefaultPattern = Pattern.compile("(?i)SET\\s+DEFAULT\\s+(.+)", Pattern.CASE_INSENSITIVE);
+                                Matcher setDefaultMatcher = setDefaultPattern.matcher(colDataTypeStr);
+                                if (setDefaultMatcher.find()) {
+                                    String defaultVal = setDefaultMatcher.group(1).trim();
+                                    
+                                    // Oracle使用MODIFY COLUMN ... DEFAULT ...
+                                    StringBuilder sb = new StringBuilder();
+                                    sb.append("ALTER TABLE ").append(tableName)
+                                            .append(" MODIFY ").append(colName)
+                                            .append(" DEFAULT ").append(defaultVal)
+                                            .append(";\n\n");
+                                    oracleSql.append(sb.toString());
+                                    processed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从toString()解析
+                        String exprStr = expr.toString();
+                        Pattern alterPattern = Pattern.compile("(?i)ALTER\\s+COLUMN\\s+([`'\"]?\\w+[`'\"]?)\\s+SET\\s+DEFAULT\\s+(.+)", Pattern.CASE_INSENSITIVE);
+                        Matcher alterMatcher = alterPattern.matcher(exprStr);
+                        if (alterMatcher.find()) {
+                            String colName = cleanIdentifier(alterMatcher.group(1));
+                            String defaultVal = alterMatcher.group(2).trim();
+                            
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("ALTER TABLE ").append(tableName)
+                                    .append(" MODIFY ").append(colName)
+                                    .append(" DEFAULT ").append(defaultVal)
+                                    .append(";\n\n");
+                            oracleSql.append(sb.toString());
+                            processed = true;
+                            continue;
+                        }
+                    }
+                }
+                
+                // 处理 RENAME COLUMN ... TO ...
+                if ("RENAME".equals(opStr)) {
+                    try {
+                        String exprStr = expr.toString();
+                        // 匹配 RENAME COLUMN old_name TO new_name
+                        Pattern renamePattern = Pattern.compile("(?i)RENAME\\s+COLUMN\\s+([`'\"]?\\w+[`'\"]?)\\s+TO\\s+([`'\"]?\\w+[`'\"]?)", Pattern.CASE_INSENSITIVE);
+                        Matcher renameMatcher = renamePattern.matcher(exprStr);
+                        if (renameMatcher.find()) {
+                            String oldColName = cleanIdentifier(renameMatcher.group(1));
+                            String newColName = cleanIdentifier(renameMatcher.group(2));
+                            
+                            // Oracle使用RENAME COLUMN语法
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("ALTER TABLE ").append(tableName)
+                                    .append(" RENAME COLUMN ").append(oldColName)
+                                    .append(" TO ").append(newColName)
+                                    .append(";\n\n");
+                            oracleSql.append(sb.toString());
+                            processed = true;
+                            continue;
+                        }
+                    } catch (Exception e) {
+                        // 忽略异常
+                    }
+                }
+                
+                // 处理 DROP COLUMN
+                if ("DROP".equals(opStr)) {
+                    try {
+                        // 尝试通过反射获取列名
+                        Method getColDataTypeListMethod = expr.getClass().getMethod("getColDataTypeList");
+                        Object colDataTypeListObj = getColDataTypeListMethod.invoke(expr);
+                        
+                        if (colDataTypeListObj instanceof List && !((List<?>) colDataTypeListObj).isEmpty()) {
+                            Object colDataTypeObj = ((List<?>) colDataTypeListObj).get(0);
+                            String colDataTypeStr = colDataTypeObj.toString();
+                            
+                            // 提取列名（第一个单词）
+                            Pattern colNamePattern = Pattern.compile("^\\s*([`'\"]?\\w+[`'\"]?)", Pattern.CASE_INSENSITIVE);
+                            Matcher colNameMatcher = colNamePattern.matcher(colDataTypeStr);
+                            if (colNameMatcher.find()) {
+                                String colName = cleanIdentifier(colNameMatcher.group(1));
+                                
+                                StringBuilder sb = new StringBuilder();
+                                sb.append("ALTER TABLE ").append(tableName)
+                                        .append(" DROP COLUMN ").append(colName)
+                                        .append(";\n\n");
+                                oracleSql.append(sb.toString());
+                                processed = true;
+                                continue;
+                            }
+                        }
+                    } catch (Exception e) {
+                        // 如果反射失败，尝试从toString()解析
+                        String exprStr = expr.toString();
+                        Pattern dropPattern = Pattern.compile("(?i)DROP\\s+COLUMN\\s+([`'\"]?\\w+[`'\"]?)", Pattern.CASE_INSENSITIVE);
+                        Matcher dropMatcher = dropPattern.matcher(exprStr);
+                        if (dropMatcher.find()) {
+                            String colName = cleanIdentifier(dropMatcher.group(1));
+                            
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("ALTER TABLE ").append(tableName)
+                                    .append(" DROP COLUMN ").append(colName)
+                                    .append(";\n\n");
+                            oracleSql.append(sb.toString());
+                            processed = true;
+                            continue;
+                        }
+                    }
+                }
+                
                 if ("ADD".equals(opStr) && expr.getIndex() != null) {
                     Object idx = expr.getIndex();
                     String idxStr = idx.toString();
                     StringBuilder sb = new StringBuilder();
-                    
+
                     Pattern pkPattern = Pattern.compile(
                             "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
                             Pattern.CASE_INSENSITIVE);
@@ -927,9 +1292,10 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                                 .append(parseAndJoinCols(cols))
                                 .append(");\n\n");
                         oracleSql.append(sb.toString());
+                        processed = true;
                         continue;
                     }
-                    
+
                     Pattern uqPattern = Pattern.compile(
                             "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*UNIQUE\\s*\\(([^)]+)\\)",
                             Pattern.CASE_INSENSITIVE);
@@ -946,9 +1312,10 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                                 .append(parseAndJoinCols(cols))
                                 .append(");\n\n");
                         oracleSql.append(sb.toString());
+                        processed = true;
                         continue;
                     }
-                    
+
                     Pattern fkPattern = Pattern.compile(
                             "CONSTRAINT\\s+([`'\"][^`'\"]+[`'\"]|[\\w_]+)?\\s*FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
                             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
@@ -971,9 +1338,10 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                                 .append(parseAndJoinCols(refCols))
                                 .append(");\n\n");
                         oracleSql.append(sb.toString());
+                        processed = true;
                         continue;
                     }
-                    
+
                     Pattern checkPattern = Pattern.compile(
                             "CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*CHECK\\s*\\((.+)\\)", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
                     Matcher checkMatcher = checkPattern.matcher(idxStr);
@@ -987,17 +1355,110 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                         }
                         sb.append("CHECK (").append(checkExpr).append(");\n\n");
                         oracleSql.append(sb.toString());
+                        processed = true;
                         continue;
                     }
                 }
             }
+            
+            // 如果成功处理了任何表达式，直接返回，不再执行后续逻辑
+            if (processed) {
+                return;
+            }
         } else {
             String s = alter.toString();
+            // 应用数据类型转换
+            s = convertDataTypeInAlter(s);
             oracleSql.append(s).append(";\n\n");
         }
-        
+
         // 如果 AlterExpression 解析失败，尝试直接从 alter.toString() 解析
         if (expressions == null || expressions.isEmpty()) {
+            // 解析 ADD COLUMN
+            Pattern addColumnPattern = Pattern.compile(
+                    "(?i)ADD\\s+(?:COLUMN\\s+)?([`'\"]?\\w+[`'\"]?)\\s+([A-Z_]+(?:\\([^)]+\\))?)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher addColumnMatcher = addColumnPattern.matcher(alterStr);
+            if (addColumnMatcher.find()) {
+                String colName = cleanIdentifier(addColumnMatcher.group(1));
+                String mysqlType = addColumnMatcher.group(2);
+                // 提取类型和参数
+                Pattern typePattern = Pattern.compile("([A-Z_]+)(?:\\(([^)]+)\\))?", Pattern.CASE_INSENSITIVE);
+                Matcher typeMatcher = typePattern.matcher(mysqlType);
+                if (typeMatcher.find()) {
+                    String typeName = typeMatcher.group(1).toUpperCase();
+                    List<String> args = new ArrayList<>();
+                    if (typeMatcher.group(2) != null) {
+                        String[] argArray = typeMatcher.group(2).split(",");
+                        for (String arg : argArray) {
+                            args.add(arg.trim());
+                        }
+                    }
+                    String oracleType = convertColumnType(typeName, args);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("ALTER TABLE ").append(tableName)
+                            .append(" ADD ").append(colName).append(" ").append(oracleType).append(";\n\n");
+                    oracleSql.append(sb.toString());
+                    return;
+                }
+            }
+
+            // 解析 MODIFY COLUMN
+            Pattern modifyColumnPattern = Pattern.compile(
+                    "(?i)MODIFY\\s+(?:COLUMN\\s+)?([`'\"]?\\w+[`'\"]?)\\s+([A-Z_]+(?:\\([^)]+\\))?)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher modifyColumnMatcher = modifyColumnPattern.matcher(alterStr);
+            if (modifyColumnMatcher.find()) {
+                String colName = cleanIdentifier(modifyColumnMatcher.group(1));
+                String mysqlType = modifyColumnMatcher.group(2);
+                Pattern typePattern = Pattern.compile("([A-Z_]+)(?:\\(([^)]+)\\))?", Pattern.CASE_INSENSITIVE);
+                Matcher typeMatcher = typePattern.matcher(mysqlType);
+                if (typeMatcher.find()) {
+                    String typeName = typeMatcher.group(1).toUpperCase();
+                    List<String> args = new ArrayList<>();
+                    if (typeMatcher.group(2) != null) {
+                        String[] argArray = typeMatcher.group(2).split(",");
+                        for (String arg : argArray) {
+                            args.add(arg.trim());
+                        }
+                    }
+                    String oracleType = convertColumnType(typeName, args);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("ALTER TABLE ").append(tableName)
+                            .append(" MODIFY ").append(colName).append(" ").append(oracleType).append(";\n\n");
+                    oracleSql.append(sb.toString());
+                    return;
+                }
+            }
+
+            // 解析 CHANGE COLUMN
+            Pattern changeColumnPattern = Pattern.compile(
+                    "(?i)CHANGE\\s+(?:COLUMN\\s+)?([`'\"]?\\w+[`'\"]?)\\s+([`'\"]?\\w+[`'\"]?)\\s+([A-Z_]+(?:\\([^)]+\\))?)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher changeColumnMatcher = changeColumnPattern.matcher(alterStr);
+            if (changeColumnMatcher.find()) {
+                String newColName = cleanIdentifier(changeColumnMatcher.group(2));
+                String mysqlType = changeColumnMatcher.group(3);
+                Pattern typePattern = Pattern.compile("([A-Z_]+)(?:\\(([^)]+)\\))?", Pattern.CASE_INSENSITIVE);
+                Matcher typeMatcher = typePattern.matcher(mysqlType);
+                if (typeMatcher.find()) {
+                    String typeName = typeMatcher.group(1).toUpperCase();
+                    List<String> args = new ArrayList<>();
+                    if (typeMatcher.group(2) != null) {
+                        String[] argArray = typeMatcher.group(2).split(",");
+                        for (String arg : argArray) {
+                            args.add(arg.trim());
+                        }
+                    }
+                    String oracleType = convertColumnType(typeName, args);
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("ALTER TABLE ").append(tableName)
+                            .append(" MODIFY ").append(newColName).append(" ").append(oracleType).append(";\n\n");
+                    oracleSql.append(sb.toString());
+                    return;
+                }
+            }
+
             // 解析 ADD CONSTRAINT PRIMARY KEY
             Pattern pkPattern = Pattern.compile(
                     "ADD\\s+CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*PRIMARY KEY\\s*\\(([^)]+)\\)",
@@ -1018,7 +1479,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 oracleSql.append(sb.toString());
                 return;
             }
-            
+
             // 解析 ADD CONSTRAINT UNIQUE
             Pattern uqPattern = Pattern.compile(
                     "ADD\\s+CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*UNIQUE\\s*\\(([^)]+)\\)",
@@ -1039,7 +1500,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 oracleSql.append(sb.toString());
                 return;
             }
-            
+
             // 解析 ADD INDEX
             Pattern indexPattern = Pattern.compile(
                     "ADD\\s+(UNIQUE\\s+)?INDEX\\s+([`'\"]?\\w+[`'\"]?)\\s*\\(([^)]+)\\)",
@@ -1049,7 +1510,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 boolean isUnique = indexMatcher.group(1) != null;
                 String idxName = cleanIdentifier(indexMatcher.group(2));
                 String cols = indexMatcher.group(3);
-                
+
                 StringBuilder sb = new StringBuilder();
                 sb.append("CREATE");
                 if (isUnique) sb.append(" UNIQUE");
@@ -1060,7 +1521,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 oracleSql.append(sb.toString());
                 return;
             }
-            
+
             // 解析 ADD CONSTRAINT FOREIGN KEY
             Pattern fkPattern = Pattern.compile(
                     "ADD\\s+CONSTRAINT\\s+([`'\"][^`'\"]+[`'\"]|[\\w_]+)?\\s*FOREIGN\\s+KEY\\s*\\(([^)]+)\\)\\s*REFERENCES\\s+([^\\s(]+)\\s*\\(([^)]+)\\)",
@@ -1087,7 +1548,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 oracleSql.append(sb.toString());
                 return;
             }
-            
+
             // 解析 ADD CONSTRAINT CHECK
             Pattern checkPattern = Pattern.compile(
                     "ADD\\s+CONSTRAINT\\s+([`'\"]?\\w+[`'\"]?)?\\s*CHECK\\s*\\((.+?)\\)",
@@ -1106,16 +1567,230 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 oracleSql.append(sb.toString());
                 return;
             }
+
+            // 解析 ALTER COLUMN ... SET DEFAULT
+            Pattern alterColumnPattern = Pattern.compile(
+                    "(?i)ALTER\\s+COLUMN\\s+([`'\"]?\\w+[`'\"]?)\\s+SET\\s+DEFAULT\\s+(.+)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher alterColumnMatcher = alterColumnPattern.matcher(alterStr);
+            if (alterColumnMatcher.find()) {
+                String colName = cleanIdentifier(alterColumnMatcher.group(1));
+                String defaultVal = alterColumnMatcher.group(2).trim();
+                StringBuilder sb = new StringBuilder();
+                sb.append("ALTER TABLE ").append(tableName)
+                        .append(" MODIFY ").append(colName)
+                        .append(" DEFAULT ").append(defaultVal)
+                        .append(";\n\n");
+                oracleSql.append(sb.toString());
+                return;
+            }
+
+            // 解析 RENAME COLUMN ... TO ...
+            Pattern renameColumnPattern = Pattern.compile(
+                    "(?i)RENAME\\s+COLUMN\\s+([`'\"]?\\w+[`'\"]?)\\s+TO\\s+([`'\"]?\\w+[`'\"]?)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher renameColumnMatcher = renameColumnPattern.matcher(alterStr);
+            if (renameColumnMatcher.find()) {
+                String oldColName = cleanIdentifier(renameColumnMatcher.group(1));
+                String newColName = cleanIdentifier(renameColumnMatcher.group(2));
+                StringBuilder sb = new StringBuilder();
+                sb.append("ALTER TABLE ").append(tableName)
+                        .append(" RENAME COLUMN ").append(oldColName)
+                        .append(" TO ").append(newColName)
+                        .append(";\n\n");
+                oracleSql.append(sb.toString());
+                return;
+            }
+
+            // 解析 DROP COLUMN
+            Pattern dropColumnPattern = Pattern.compile(
+                    "(?i)DROP\\s+COLUMN\\s+([`'\"]?\\w+[`'\"]?)",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher dropColumnMatcher = dropColumnPattern.matcher(alterStr);
+            if (dropColumnMatcher.find()) {
+                String colName = cleanIdentifier(dropColumnMatcher.group(1));
+                StringBuilder sb = new StringBuilder();
+                sb.append("ALTER TABLE ").append(tableName)
+                        .append(" DROP COLUMN ").append(colName)
+                        .append(";\n\n");
+                oracleSql.append(sb.toString());
+                return;
+            }
+        }
+
+        // 如果都无法解析，应用数据类型转换后输出原始语句
+        String convertedAlter = convertDataTypeInAlter(alterStr);
+        oracleSql.append(convertedAlter).append(";\n\n");
+    }
+
+    // 辅助方法：转换ALTER语句中的数据类型
+    private String convertDataTypeInAlter(String alterStr) {
+        if (alterStr == null || alterStr.trim().isEmpty()) {
+            return alterStr;
+        }
+
+        // 匹配数据类型模式：INT, VARCHAR(255), DATETIME, BIGINT等
+        // 需要匹配：ADD COLUMN col_name TYPE, MODIFY COLUMN col_name TYPE, CHANGE COLUMN old_name new_name TYPE
+        String result = alterStr;
+
+        // 匹配数据类型（包括带括号的参数）
+        // 匹配模式：数据类型名(可选参数) 或 数据类型名
+        Pattern dataTypePattern = Pattern.compile(
+            "\\b(INT|VARCHAR|DATETIME|TIMESTAMP|BIGINT|TINYINT|BOOLEAN|BOOL|TEXT|LONGTEXT|MEDIUMTEXT|TINYTEXT|FLOAT|DOUBLE|DECIMAL|CHAR|BLOB|LONGBLOB|MEDIUMBLOB|TINYBLOB|DATE|TIME|YEAR|SMALLINT|MEDIUMINT|NUMERIC|REAL|BIT|BINARY|VARBINARY|ENUM|SET)\\s*(?:\\([^)]*\\))?",
+            Pattern.CASE_INSENSITIVE
+        );
+
+        Matcher matcher = dataTypePattern.matcher(result);
+        StringBuffer sb = new StringBuffer();
+
+        while (matcher.find()) {
+            String mysqlType = matcher.group(1).toUpperCase();
+            String fullMatch = matcher.group(0); // 包含括号的完整匹配
+            
+            // 提取参数
+            List<String> args = new ArrayList<>();
+            Pattern argPattern = Pattern.compile("\\(([^)]+)\\)");
+            Matcher argMatcher = argPattern.matcher(fullMatch);
+            if (argMatcher.find()) {
+                String argStr = argMatcher.group(1);
+                // 分割参数（可能有多个，如DECIMAL(10,2)）
+                String[] argArray = argStr.split(",");
+                for (String arg : argArray) {
+                    args.add(arg.trim());
+                }
+            }
+
+            // 转换数据类型
+            String oracleType = convertColumnType(mysqlType, args);
+            
+            // 替换为Oracle类型
+            matcher.appendReplacement(sb, Matcher.quoteReplacement(oracleType));
+        }
+        matcher.appendTail(sb);
+
+        return sb.toString();
+    }
+
+    // 辅助方法：转换CONCAT函数为Oracle的||连接符
+    private String convertConcatFunction(String sql) {
+        if (sql == null || sql.isEmpty()) return sql;
+        
+        // 匹配 CONCAT(arg1, arg2, ...) 模式
+        // 需要处理嵌套的括号和引号
+        Pattern concatPattern = Pattern.compile("(?i)CONCAT\\s*\\(", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = concatPattern.matcher(sql);
+        
+        if (!matcher.find()) {
+            return sql; // 没有CONCAT函数
         }
         
-        // 如果都无法解析，直接输出原始语句
-        oracleSql.append(alterStr).append(";\n\n");
+        StringBuilder result = new StringBuilder();
+        int lastEnd = 0;
+        matcher.reset();
+        
+        while (matcher.find()) {
+            result.append(sql.substring(lastEnd, matcher.start()));
+            
+            int depth = 1;
+            int pos = matcher.end();
+            boolean inString = false;
+            char stringChar = 0;
+            
+            // 找到匹配的右括号
+            while (pos < sql.length() && depth > 0) {
+                char ch = sql.charAt(pos);
+                
+                if (!inString && (ch == '\'' || ch == '"')) {
+                    inString = true;
+                    stringChar = ch;
+                } else if (inString && ch == stringChar && (pos == 0 || sql.charAt(pos - 1) != '\\')) {
+                    inString = false;
+                } else if (!inString && ch == '(') {
+                    depth++;
+                } else if (!inString && ch == ')') {
+                    depth--;
+                    if (depth == 0) {
+                        // 找到了匹配的右括号
+                        String concatContent = sql.substring(matcher.end(), pos);
+                        // 解析参数并转换为||连接
+                        String converted = convertConcatParameters(concatContent);
+                        result.append("(").append(converted).append(")");
+                        pos++;
+                        break;
+                    }
+                }
+                pos++;
+            }
+            
+            lastEnd = pos;
+        }
+        
+        result.append(sql.substring(lastEnd));
+        return result.toString();
+    }
+    
+    // 辅助方法：转换CONCAT的参数为||连接符
+    private String convertConcatParameters(String params) {
+        if (params == null || params.trim().isEmpty()) {
+            return "";
+        }
+        
+        List<String> args = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        int depth = 0;
+        boolean inString = false;
+        char stringChar = 0;
+        
+        for (int i = 0; i < params.length(); i++) {
+            char ch = params.charAt(i);
+            
+            if (!inString && (ch == '\'' || ch == '"')) {
+                inString = true;
+                stringChar = ch;
+                current.append(ch);
+            } else if (inString && ch == stringChar && (i == 0 || params.charAt(i - 1) != '\\')) {
+                inString = false;
+                current.append(ch);
+            } else if (!inString && ch == '(') {
+                depth++;
+                current.append(ch);
+            } else if (!inString && ch == ')') {
+                depth--;
+                current.append(ch);
+            } else if (!inString && depth == 0 && ch == ',') {
+                args.add(current.toString().trim());
+                current = new StringBuilder();
+            } else {
+                current.append(ch);
+            }
+        }
+        
+        if (current.length() > 0) {
+            args.add(current.toString().trim());
+        }
+        
+        // 用 || 连接所有参数
+        if (args.isEmpty()) {
+            return "";
+        }
+        
+        StringBuilder result = new StringBuilder();
+        for (int i = 0; i < args.size(); i++) {
+            if (i > 0) {
+                result.append(" || ");
+            }
+            result.append(args.get(i));
+        }
+        
+        return result.toString();
     }
 
     // 工具方法：转换 MySQL 函数为 Oracle 函数
     private String convertMysqlFunctions(String sql) {
         if (sql == null) return "";
         String result = sql;
+        // 先转换CONCAT函数
+        result = convertConcatFunction(result);
         // NOW() -> SYSDATE
         result = result.replaceAll("(?i)\\bNOW\\s*\\(\\s*\\)", "SYSDATE");
         // CURRENT_TIMESTAMP -> SYSDATE
@@ -1137,7 +1812,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
     public void visit(Insert insert) {
         String tableName = getFullTableName(insert.getTable());
         List<Column> columns = insert.getColumns();
-        
+
         // 生成列名部分（如果有）
         StringBuilder columnPart = new StringBuilder();
         if (columns != null && !columns.isEmpty()) {
@@ -1154,26 +1829,24 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         try {
             Method getValuesMethod = Insert.class.getMethod("getValues");
             Object valuesObj = getValuesMethod.invoke(insert);
-            
+
             if (valuesObj != null) {
                 // 处理 ExpressionList（单行或多行）
                 List<List<Expression>> valueRows = extractInsertValueRows(valuesObj);
-                
+
                 if (valueRows != null && !valueRows.isEmpty()) {
                     // 如果是多行插入，为每一行生成一个独立的 INSERT 语句
                     for (int i = 0; i < valueRows.size(); i++) {
                         List<Expression> rowExprs = valueRows.get(i);
                         oracleSql.append("INSERT INTO ").append(tableName).append(columnPart);
                         oracleSql.append(" VALUES (");
-                        
+
                         for (int j = 0; j < rowExprs.size(); j++) {
                             if (j > 0) oracleSql.append(", ");
-                            String exprStr = rowExprs.get(j).toString();
-                            exprStr = convertMysqlFunctions(exprStr);
-                            exprStr = replaceBooleanLiterals(exprStr);
-                            oracleSql.append(exprStr);
+                            String formattedValue = formatInsertValue(rowExprs.get(j));
+                            oracleSql.append(formattedValue);
                         }
-                        
+
                         oracleSql.append(");\n");
                     }
                     oracleSql.append("\n");
@@ -1183,7 +1856,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         } catch (Exception e) {
             // 如果反射失败，尝试从 toString() 解析
         }
-        
+
         // 回退：从 toString() 解析（单行或多行）
         String insertStr = insert.toString();
         int valuesIdx = insertStr.toUpperCase().indexOf("VALUES");
@@ -1191,7 +1864,9 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
             String valuesPart = insertStr.substring(valuesIdx + 6).trim();
             valuesPart = convertMysqlFunctions(valuesPart);
             valuesPart = replaceBooleanLiterals(valuesPart);
-            
+            // 处理Timestamp值
+            valuesPart = formatTimestampInValuesString(valuesPart);
+
             // 检查是否是多行插入（包含多个括号对）
             if (isMultiRowInsert(valuesPart)) {
                 // 解析多行值
@@ -1203,7 +1878,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 oracleSql.append("\n");
                 return;
             }
-            
+
             // 单行插入
             oracleSql.append("INSERT INTO ").append(tableName).append(columnPart);
             oracleSql.append(" VALUES ").append(valuesPart);
@@ -1219,46 +1894,37 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
     @SuppressWarnings("unchecked")
     private List<List<Expression>> extractInsertValueRows(Object valuesObj) {
         if (valuesObj == null) return null;
-        
+
         try {
             // 尝试获取 getExpressions() 方法
             Method getExprsMethod = valuesObj.getClass().getMethod("getExpressions");
             Object exprsObj = getExprsMethod.invoke(valuesObj);
-            
+
             if (exprsObj instanceof List) {
                 List<Expression> expressions = (List<Expression>) exprsObj;
-                
+
                 if (expressions.isEmpty()) {
                     return null;
                 }
+
+                // 检查第一个表达式的类型和字符串表示
+                Expression firstExpr = expressions.get(0);
+                String firstExprStr = firstExpr.toString().trim();
+                String firstExprClassName = firstExpr.getClass().getSimpleName();
                 
-                // 检查是否是多行插入（第一个元素以括号开头，可能是 ParenthesedExpressionList）
-                String firstExprStr = expressions.get(0).toString().trim();
-                if (firstExprStr.startsWith("(")) {
-                    // 多行插入：每个元素是一行
+                // 判断是否是多行插入：
+                // 1. 第一个表达式以"("开头，或
+                // 2. 第一个表达式是ParenthesedExpressionList类型
+                boolean isMultiRow = firstExprStr.startsWith("(") || 
+                                    firstExprClassName.contains("ParenthesedExpressionList");
+
+                if (isMultiRow) {
+                    // 多行插入：每个元素是一行（ParenthesedExpressionList）
                     List<List<Expression>> rows = new ArrayList<>();
                     for (Expression expr : expressions) {
-                        // 尝试从每个 Expression 中提取表达式列表
-                        try {
-                            Method getExprsInExpr = expr.getClass().getMethod("getExpressions");
-                            Object innerExprsObj = getExprsInExpr.invoke(expr);
-                            if (innerExprsObj instanceof List) {
-                                rows.add((List<Expression>) innerExprsObj);
-                            } else {
-                                // 如果不是列表，可能是单个表达式，创建单元素列表
-                                List<Expression> singleRow = new ArrayList<>();
-                                singleRow.add(expr);
-                                rows.add(singleRow);
-                            }
-                        } catch (Exception e) {
-                            // 无法获取内部表达式，尝试将整个表达式作为单个值
-                            // 这种情况需要从字符串解析
-                            String exprStr = expr.toString();
-                            // 解析括号内的值：('Bob', 'bob@example.com')
-                            List<Expression> row = parseExpressionListFromString(exprStr);
-                            if (row != null && !row.isEmpty()) {
-                                rows.add(row);
-                            }
+                        List<Expression> rowExprs = extractExpressionsFromParenthesedList(expr);
+                        if (rowExprs != null && !rowExprs.isEmpty()) {
+                            rows.add(rowExprs);
                         }
                     }
                     return rows.isEmpty() ? null : rows;
@@ -1272,49 +1938,103 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         } catch (Exception e) {
             // 如果解析失败，返回 null，让调用者使用 toString() 解析
         }
-        
+
         return null;
     }
-    
+
+    // 辅助方法：从ParenthesedExpressionList中提取表达式列表
+    @SuppressWarnings("unchecked")
+    private List<Expression> extractExpressionsFromParenthesedList(Expression expr) {
+        if (expr == null) return null;
+
+        try {
+            // 方法1：尝试调用getExpressions()方法
+            Method getExprsMethod = expr.getClass().getMethod("getExpressions");
+            Object innerExprsObj = getExprsMethod.invoke(expr);
+            
+            if (innerExprsObj instanceof List) {
+                List<Expression> innerExprs = (List<Expression>) innerExprsObj;
+                if (!innerExprs.isEmpty()) {
+                    return innerExprs;
+                }
+            }
+        } catch (Exception e) {
+            // getExpressions()方法不存在或调用失败，尝试其他方法
+        }
+
+        // 方法2：检查是否是ParenthesedExpressionList，尝试其他可能的getter方法
+        try {
+            String className = expr.getClass().getSimpleName();
+            if (className.contains("ParenthesedExpressionList") || className.contains("ExpressionList")) {
+                // 尝试获取内部表达式列表的其他方法
+                Method[] methods = expr.getClass().getMethods();
+                for (Method method : methods) {
+                    String methodName = method.getName();
+                    if (methodName.equals("getExpressions") || 
+                        methodName.equals("getExpressionList") ||
+                        (methodName.startsWith("get") && methodName.contains("Expression"))) {
+                        try {
+                            Object result = method.invoke(expr);
+                            if (result instanceof List) {
+                                List<?> list = (List<?>) result;
+                                if (!list.isEmpty() && list.get(0) instanceof Expression) {
+                                    return (List<Expression>) list;
+                                }
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // 忽略异常
+        }
+
+        // 方法3：如果无法提取，返回包含该表达式本身的单元素列表
+        List<Expression> singleRow = new ArrayList<>();
+        singleRow.add(expr);
+        return singleRow;
+    }
+
     // 辅助方法：从字符串解析表达式列表（简单实现，主要用于回退）
     private List<Expression> parseExpressionListFromString(String exprStr) {
         // 这是一个简化实现，实际应该使用 JSQLParser 来解析
         // 这里返回 null，让调用者使用其他方法
         return null;
     }
-    
+
     // 辅助方法：检查是否是多行插入
     private boolean isMultiRowInsert(String valuesPart) {
         if (valuesPart == null || valuesPart.trim().isEmpty()) {
             return false;
         }
-        
+
         // 简单判断：如果包含 "), (" 模式，很可能是多行插入
         Pattern multiRowPattern = Pattern.compile("\\)\\s*,\\s*\\(");
         return multiRowPattern.matcher(valuesPart).find();
     }
-    
+
     // 辅助方法：解析多行值字符串
     private List<String> parseMultiRowValues(String valuesPart) {
         List<String> rows = new ArrayList<>();
-        
+
         if (valuesPart == null || valuesPart.trim().isEmpty()) {
             return rows;
         }
-        
-        // 使用正则表达式或手动解析，将 "('val1', 'val2'), ('val3', 'val4')" 
+
+        // 使用正则表达式或手动解析，将 "('val1', 'val2'), ('val3', 'val4')"
         // 分割成 ["('val1', 'val2')", "('val3', 'val4')"]
-        
+
         List<String> result = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         int depth = 0;
         boolean inString = false;
         char stringChar = 0;
         int startPos = -1;
-        
+
         for (int i = 0; i < valuesPart.length(); i++) {
             char c = valuesPart.charAt(i);
-            
+
             if (!inString && (c == '\'' || c == '"')) {
                 inString = true;
                 stringChar = c;
@@ -1344,9 +2064,9 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                     current = new StringBuilder();
                     startPos = -1;
                     // 跳过可能的逗号和空格
-                    while (i + 1 < valuesPart.length() && 
-                           (valuesPart.charAt(i + 1) == ',' || 
-                            Character.isWhitespace(valuesPart.charAt(i + 1)))) {
+                    while (i + 1 < valuesPart.length() &&
+                            (valuesPart.charAt(i + 1) == ',' ||
+                                    Character.isWhitespace(valuesPart.charAt(i + 1)))) {
                         i++;
                     }
                 }
@@ -1354,7 +2074,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 current.append(c);
             }
         }
-        
+
         // 如果还有剩余的内容（单行插入的情况）
         if (depth == 0 && current.length() > 0) {
             String row = current.toString().trim();
@@ -1362,7 +2082,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 result.add(row);
             }
         }
-        
+
         return result.isEmpty() ? Arrays.asList(valuesPart.trim()) : result;
     }
 
@@ -1376,7 +2096,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         List<Column> cols = update.getColumns();
         @SuppressWarnings("unchecked")
         List<Expression> exprs = (List<Expression>) (List<?>) update.getExpressions();
-        
+
         for (int i = 0; i < cols.size(); i++) {
             String colName = cleanIdentifier(cols.get(i).getColumnName());
             Expression expr = exprs.get(i);
@@ -1394,21 +2114,104 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
         oracleSql.append(";\n\n");
     }
 
+    // 辅助方法：检查表达式是否是Timestamp类型
+    private boolean isTimestampExpression(Expression expr) {
+        if (expr == null) return false;
+
+        // 检查类名是否包含Timestamp
+        String className = expr.getClass().getSimpleName();
+        if (className.contains("Timestamp") || className.contains("DateTime")) {
+            return true;
+        }
+
+        // 检查是否是StringValue且内容是日期时间格式
+        try {
+            String exprStr = expr.toString().trim();
+            // 移除可能的引号
+            if ((exprStr.startsWith("'") && exprStr.endsWith("'")) ||
+                (exprStr.startsWith("\"") && exprStr.endsWith("\""))) {
+                String innerValue = exprStr.substring(1, exprStr.length() - 1);
+                // 检查是否符合日期时间格式：YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD HH:MM:SS.SSS
+                Pattern timestampPattern = Pattern.compile(
+                    "^\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?$"
+                );
+                if (timestampPattern.matcher(innerValue).matches()) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            // 忽略异常
+        }
+
+        return false;
+    }
+
+    // 辅助方法：格式化INSERT值（如果是Timestamp，添加TIMESTAMP前缀）
+    private String formatInsertValue(Expression expr) {
+        if (expr == null) return "";
+
+        String exprStr = expr.toString();
+        
+        // 检查是否是Timestamp
+        if (isTimestampExpression(expr)) {
+            // 如果是带引号的字符串，提取内部值并添加TIMESTAMP前缀
+            String trimmed = exprStr.trim();
+            if ((trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+                (trimmed.startsWith("\"") && trimmed.endsWith("\""))) {
+                return "TIMESTAMP " + trimmed;
+            } else {
+                // 如果没有引号，添加引号和TIMESTAMP前缀
+                return "TIMESTAMP '" + trimmed + "'";
+            }
+        }
+
+        // 非Timestamp值，正常处理
+        exprStr = convertMysqlFunctions(exprStr);
+        exprStr = replaceBooleanLiterals(exprStr);
+        return exprStr;
+    }
+
+    // 辅助方法：在VALUES字符串中格式化Timestamp值
+    private String formatTimestampInValuesString(String valuesStr) {
+        if (valuesStr == null || valuesStr.trim().isEmpty()) {
+            return valuesStr;
+        }
+
+        // 匹配日期时间格式的字符串值：'YYYY-MM-DD HH:MM:SS' 或 'YYYY-MM-DD HH:MM:SS.SSS'
+        // 使用正则表达式匹配，但要小心处理嵌套的括号和引号
+        Pattern timestampPattern = Pattern.compile(
+            "(['\"])(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?)\\1"
+        );
+
+        Matcher matcher = timestampPattern.matcher(valuesStr);
+        StringBuffer result = new StringBuffer();
+        
+        while (matcher.find()) {
+            String quote = matcher.group(1); // 引号类型（单引号或双引号）
+            String timestampValue = matcher.group(2); // 日期时间值
+            // 替换为 TIMESTAMP 'value'
+            matcher.appendReplacement(result, "TIMESTAMP " + quote + timestampValue + quote);
+        }
+        matcher.appendTail(result);
+
+        return result.toString();
+    }
+
     // 辅助方法：转换表达式（处理 MySQL 函数、布尔值、列名等）
     private String convertExpression(Expression expr) {
         if (expr == null) return "";
-        
+
         String exprStr = expr.toString();
-        
+
         // 转换 MySQL 函数为 Oracle 函数
         exprStr = convertMysqlFunctions(exprStr);
-        
+
         // 替换布尔值
         exprStr = replaceBooleanLiterals(exprStr);
-        
+
         // 转换列名为大写（跳过字符串和函数）
         exprStr = uppercaseWhereColumnNames(exprStr);
-        
+
         return exprStr;
     }
 
@@ -1416,14 +2219,93 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
     @Override
     public void visit(Delete delete) {
         String tableName = getFullTableName(delete.getTable());
-        oracleSql.append("DELETE FROM ").append(tableName);
         
+        // 检查是否有ORDER BY和LIMIT，如果有需要使用子查询
+        boolean hasOrderBy = false;
+        boolean hasLimit = false;
+        long rowCount = 0;
+        
+        try {
+            Method getOrderByMethod = delete.getClass().getMethod("getOrderByElements");
+            Object orderByObj = getOrderByMethod.invoke(delete);
+            hasOrderBy = orderByObj != null && orderByObj instanceof List && !((List<?>) orderByObj).isEmpty();
+        } catch (Exception e) {
+            // 忽略
+        }
+        
+        try {
+            Method getLimitMethod = delete.getClass().getMethod("getLimit");
+            Object limitObj = getLimitMethod.invoke(delete);
+            if (limitObj != null) {
+                hasLimit = true;
+                try {
+                    Method getRowCountMethod = limitObj.getClass().getMethod("getRowCount");
+                    Object rowCountObj = getRowCountMethod.invoke(limitObj);
+                    if (rowCountObj instanceof LongValue) {
+                        rowCount = ((LongValue) rowCountObj).getValue();
+                    } else if (rowCountObj instanceof Long) {
+                        rowCount = (Long) rowCountObj;
+                    } else if (rowCountObj != null) {
+                        rowCount = Long.parseLong(rowCountObj.toString());
+                    }
+                } catch (Exception e) {
+                    // 忽略
+                }
+            }
+        } catch (Exception e) {
+            // 忽略
+        }
+        
+        // 如果有ORDER BY或LIMIT，需要使用子查询方式
+        if (hasOrderBy || hasLimit) {
+            // Oracle DELETE with ORDER BY/LIMIT需要使用子查询
+            oracleSql.append("DELETE FROM ").append(tableName).append(" WHERE ROWID IN (\n");
+            oracleSql.append("  SELECT ROWID FROM ").append(tableName);
+            
+            Expression where = delete.getWhere();
+            if (where != null) {
+                String whereStr = convertExpression(where);
+                oracleSql.append(" WHERE ").append(whereStr);
+            }
+            
+            // 处理 ORDER BY
+            if (hasOrderBy) {
+                try {
+                    Method getOrderByMethod = delete.getClass().getMethod("getOrderByElements");
+                    Object orderByObj = getOrderByMethod.invoke(delete);
+                    if (orderByObj instanceof List) {
+                        oracleSql.append(" ORDER BY ");
+                        boolean first = true;
+                        for (Object orderElem : (List<?>) orderByObj) {
+                            if (!first) oracleSql.append(", ");
+                            String orderStr = orderElem.toString();
+                            orderStr = uppercaseWhereColumnNames(orderStr);
+                            oracleSql.append(orderStr);
+                            first = false;
+                        }
+                    }
+                } catch (Exception e) {
+                    // 忽略
+                }
+            }
+            
+            // 处理 LIMIT
+            if (hasLimit && rowCount > 0) {
+                oracleSql.append(" FETCH FIRST ").append(rowCount).append(" ROWS ONLY");
+            }
+            
+            oracleSql.append("\n)");
+        } else {
+            // 简单的DELETE语句
+        oracleSql.append("DELETE FROM ").append(tableName);
+
         Expression where = delete.getWhere();
         if (where != null) {
             String whereStr = convertExpression(where);
             oracleSql.append(" WHERE ").append(whereStr);
+            }
         }
-        
+
         oracleSql.append(";\n\n");
     }
 
@@ -1433,7 +2315,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
     public void visit(Select select) {
         if (select.getSelectBody() instanceof PlainSelect) {
             PlainSelect plainSelect = (PlainSelect) select.getSelectBody();
-            
+
             // 处理 SELECT 列表
             oracleSql.append("SELECT ");
             if (plainSelect.getSelectItems() != null) {
@@ -1441,6 +2323,8 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 for (Object item : plainSelect.getSelectItems()) {
                     if (!first) oracleSql.append(", ");
                     String itemStr = item.toString();
+                    // 转换CONCAT函数为||连接符
+                    itemStr = convertMysqlFunctions(itemStr);
                     // 转换列名为大写
                     itemStr = uppercaseWhereColumnNames(itemStr);
                     oracleSql.append(itemStr);
@@ -1449,7 +2333,7 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
             } else {
                 oracleSql.append("*");
             }
-            
+
             // 处理 FROM
             if (plainSelect.getFromItem() != null) {
                 String fromStr = plainSelect.getFromItem().toString();
@@ -1462,13 +2346,13 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                 }
                 oracleSql.append(" FROM ").append(fromStr);
             }
-            
+
             // 处理 WHERE
             if (plainSelect.getWhere() != null) {
                 String whereStr = convertExpression(plainSelect.getWhere());
                 oracleSql.append(" WHERE ").append(whereStr);
             }
-            
+
             // 处理 ORDER BY
             if (plainSelect.getOrderByElements() != null) {
                 oracleSql.append(" ORDER BY ");
@@ -1481,14 +2365,38 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                     first = false;
                 }
             }
-            
+
+            // 处理 OFFSET（从PlainSelect获取）
+            long offset = 0;
+            try {
+                Method getOffsetMethod = plainSelect.getClass().getMethod("getOffset");
+                Object offsetObj = getOffsetMethod.invoke(plainSelect);
+                if (offsetObj != null) {
+                    try {
+                        Method getOffsetValueMethod = offsetObj.getClass().getMethod("getOffset");
+                        Object offsetValueObj = getOffsetValueMethod.invoke(offsetObj);
+                        if (offsetValueObj instanceof LongValue) {
+                            offset = ((LongValue) offsetValueObj).getValue();
+                        } else if (offsetValueObj instanceof Long) {
+                            offset = (Long) offsetValueObj;
+                        } else if (offsetValueObj != null) {
+                            offset = Long.parseLong(offsetValueObj.toString());
+                        }
+                    } catch (Exception e) {
+                        // 忽略
+                    }
+                }
+            } catch (Exception e) {
+                // 忽略
+            }
+
             // 处理 LIMIT -> ROWNUM 或 FETCH FIRST
             if (plainSelect.getLimit() != null) {
                 try {
                     Object limitObj = plainSelect.getLimit();
                     Method getRowCountMethod = limitObj.getClass().getMethod("getRowCount");
                     Object rowCountObj = getRowCountMethod.invoke(limitObj);
-                    
+
                     long rowCount = 0;
                     if (rowCountObj instanceof LongValue) {
                         rowCount = ((LongValue) rowCountObj).getValue();
@@ -1497,30 +2405,32 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                     } else if (rowCountObj != null) {
                         rowCount = Long.parseLong(rowCountObj.toString());
                     }
-                    
+
                     if (rowCount > 0) {
-                        // 检查是否有 OFFSET
+                        // 检查是否有 OFFSET（优先使用从PlainSelect获取的offset，如果没有则从Limit对象获取）
+                        if (offset == 0) {
                         try {
                             Method getOffsetMethod = limitObj.getClass().getMethod("getOffset");
                             Object offsetObj = getOffsetMethod.invoke(limitObj);
-                            long offset = 0;
+                                if (offsetObj != null) {
                             if (offsetObj instanceof LongValue) {
                                 offset = ((LongValue) offsetObj).getValue();
                             } else if (offsetObj instanceof Long) {
                                 offset = (Long) offsetObj;
                             } else if (offsetObj != null) {
                                 offset = Long.parseLong(offsetObj.toString());
+                                    }
+                                }
+                            } catch (Exception e) {
+                                // 忽略
                             }
-                            
+                            }
+
                             if (offset > 0) {
                                 // Oracle 12c+ 使用 OFFSET ... ROWS FETCH NEXT ... ROWS ONLY
                                 oracleSql.append(" OFFSET ").append(offset).append(" ROWS FETCH NEXT ").append(rowCount).append(" ROWS ONLY");
                             } else {
                                 // 使用 FETCH FIRST ... ROWS ONLY (Oracle 12c+)
-                                oracleSql.append(" FETCH FIRST ").append(rowCount).append(" ROWS ONLY");
-                            }
-                        } catch (Exception e) {
-                            // 没有 OFFSET，使用 FETCH FIRST
                             oracleSql.append(" FETCH FIRST ").append(rowCount).append(" ROWS ONLY");
                         }
                     }
@@ -1532,11 +2442,18 @@ public class MysqlToOracleVisitor extends StatementVisitorAdapter {
                     java.util.regex.Matcher limitMatcher = limitPattern.matcher(limitStr);
                     if (limitMatcher.find()) {
                         long rowCount = Long.parseLong(limitMatcher.group(1));
+                        if (offset > 0) {
+                            oracleSql.append(" OFFSET ").append(offset).append(" ROWS FETCH NEXT ").append(rowCount).append(" ROWS ONLY");
+                        } else {
                         oracleSql.append(" FETCH FIRST ").append(rowCount).append(" ROWS ONLY");
                     }
                 }
+                }
+            } else if (offset > 0) {
+                // 只有OFFSET没有LIMIT的情况（Oracle不支持，但可以转换为大数）
+                oracleSql.append(" OFFSET ").append(offset).append(" ROWS");
             }
-            
+
             oracleSql.append(";\n\n");
         } else {
             // 非 PlainSelect，直接转换
